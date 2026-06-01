@@ -9,15 +9,17 @@ Properties:
 - Tests target APIs through the same single-node delay API.
 - Does NOT call /group/{group}/delay.
 - Default mode scans all matched US nodes and restores unexpected strategy-group changes.
-- Auto-switch mode is current-first: test current US node only; scan candidates only when current is not good.
+- Auto-switch mode is current-first: test current US node only; scan candidates only when policy allows it.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import socket
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -30,6 +32,16 @@ DEFAULT_TARGETS = {"discord": "https://discord.com/api/v10/gateway"}
 DEFAULT_PREFER_GROUPS = ["🤖 OpenAi", "🤖AI网站", "🔰 代理", "🚀节点选择", "GLOBAL"]
 GOOD_DELAY_MS = 300
 SLOW_DELAY_MS = 800
+DEFAULT_STATE_FILE = "logs/auto_switch_state.json"
+DEFAULT_BAD_THRESHOLD = "poor"
+DEFAULT_BAD_CONFIRM_COUNT = 2
+DEFAULT_SLOW_SWITCH_THRESHOLD_MS = 600
+DEFAULT_SLOW_CONFIRM_COUNT = 5
+DEFAULT_SWITCH_COOLDOWN_SECONDS = 600
+DEFAULT_BREAK_COOLDOWN_DEAD_COUNT = 3
+DEFAULT_MIN_IMPROVEMENT_MS = 100
+DEFAULT_AVOID_RECENT_SWITCHES = 3
+DEFAULT_AVOID_RECENT_WINDOW_SECONDS = 1800
 
 
 def delay_level(ok: bool, delay: int | None) -> str:
@@ -343,6 +355,283 @@ def current_needs_switch(result: NodeResult, switch_check_target: str | None) ->
     return check.level != "good", source, check.level
 
 
+def load_switch_state(path: str | None) -> tuple[dict[str, Any], str | None]:
+    if not path:
+        return {}, None
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        return {}, str(exc)
+    if not isinstance(data, dict):
+        return {}, "state root is not a JSON object"
+    return data, None
+
+
+def save_switch_state(path: str | None, state: dict[str, Any]) -> str | None:
+    if not path:
+        return None
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        return None
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        return str(exc)
+
+
+def _positive(value: int) -> int:
+    return max(1, int(value))
+
+
+def normalize_bad_threshold(value: str) -> str:
+    value = value.strip().lower()
+    if value != "poor":
+        raise ValueError(f"--bad-threshold currently supports only 'poor': {value}")
+    return value
+
+
+def decide_switch_policy(
+    state: dict[str, Any],
+    *,
+    now: float,
+    current_group: str | None,
+    current_node: str | None,
+    switch_by: str,
+    switch_level: str,
+    check: CheckResult | None,
+    state_load_error: str | None,
+    bad_threshold: str,
+    bad_confirm_count: int,
+    slow_switch_threshold_ms: int,
+    slow_confirm_count: int,
+    switch_cooldown_seconds: int,
+    break_cooldown_dead_count: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    bad_confirm_count = _positive(bad_confirm_count)
+    slow_confirm_count = _positive(slow_confirm_count)
+    break_cooldown_dead_count = _positive(break_cooldown_dead_count)
+    switch_cooldown_seconds = max(0, int(switch_cooldown_seconds))
+    current_key = f"{current_group or ''}\n{current_node or ''}\n{switch_by}"
+    previous = state.get("current") if isinstance(state.get("current"), dict) else {}
+    same_current = previous.get("key") == current_key
+    bad_count = int(previous.get("bad_count", 0)) if same_current else 0
+    slow_count = int(previous.get("slow_count", 0)) if same_current else 0
+    dead_count = int(previous.get("dead_count", 0)) if same_current else 0
+
+    delay = check.delay if check is not None else None
+    is_dead = switch_level == "dead"
+    is_good = switch_level == "good"
+    is_slow = switch_level == "slow"
+    is_bad = switch_level in {"poor", "dead", "missing", "unknown"}
+    slow_over_threshold = is_slow and delay is not None and delay > slow_switch_threshold_ms
+
+    reason = "current_node_good"
+    required_count = 1
+    observed_count = 0
+    eligible_after_confirm = False
+    state_blocked = bool(state_load_error)
+
+    if is_good:
+        bad_count = 0
+        slow_count = 0
+        dead_count = 0
+        reason = "current_node_good"
+    elif is_slow and not slow_over_threshold:
+        bad_count = 0
+        slow_count = 0
+        dead_count = 0
+        reason = "current_node_slow_acceptable"
+    elif slow_over_threshold:
+        slow_count += 1
+        bad_count = 0
+        dead_count = 0
+        required_count = slow_confirm_count
+        observed_count = slow_count
+        eligible_after_confirm = slow_count >= slow_confirm_count
+        reason = "slow_confirmed" if eligible_after_confirm else "slow_wait_confirm"
+    elif is_bad:
+        bad_count += 1
+        dead_count = dead_count + 1 if is_dead else 0
+        slow_count = 0
+        required_count = bad_confirm_count
+        observed_count = bad_count
+        eligible_after_confirm = bad_count >= bad_confirm_count
+        reason = "bad_confirmed" if eligible_after_confirm else "bad_wait_confirm"
+    else:
+        bad_count = 0
+        slow_count = 0
+        dead_count = 0
+        reason = "current_node_acceptable"
+
+    last_switch = state.get("last_switch") if isinstance(state.get("last_switch"), dict) else {}
+    last_switch_at = last_switch.get("at")
+    try:
+        last_switch_at = float(last_switch_at)
+    except (TypeError, ValueError):
+        last_switch_at = None
+    cooldown_remaining = 0
+    in_cooldown = False
+    if last_switch_at is not None and switch_cooldown_seconds > 0:
+        elapsed = max(0, now - last_switch_at)
+        cooldown_remaining = max(0, int(switch_cooldown_seconds - elapsed))
+        in_cooldown = cooldown_remaining > 0
+    cooldown_break_allowed = in_cooldown and dead_count >= break_cooldown_dead_count
+
+    should_scan = eligible_after_confirm and not state_blocked
+    if should_scan and in_cooldown and not cooldown_break_allowed:
+        should_scan = False
+        reason = "switch_cooldown_active"
+    elif state_blocked:
+        should_scan = False
+        reason = "state_load_error"
+
+    new_state = dict(state)
+    new_state["current"] = {
+        "key": current_key,
+        "group": current_group,
+        "node": current_node,
+        "switch_by": switch_by,
+        "level": switch_level,
+        "delay_ms": delay,
+        "bad_count": bad_count,
+        "slow_count": slow_count,
+        "dead_count": dead_count,
+        "updated_at": now,
+    }
+    policy = {
+        "state_load_error": state_load_error,
+        "bad_threshold": bad_threshold,
+        "bad_confirm_count": bad_confirm_count,
+        "slow_switch_threshold_ms": slow_switch_threshold_ms,
+        "slow_confirm_count": slow_confirm_count,
+        "switch_cooldown_seconds": switch_cooldown_seconds,
+        "break_cooldown_dead_count": break_cooldown_dead_count,
+        "bad_count": bad_count,
+        "slow_count": slow_count,
+        "dead_count": dead_count,
+        "required_count": required_count,
+        "observed_count": observed_count,
+        "in_cooldown": in_cooldown,
+        "cooldown_remaining_seconds": cooldown_remaining,
+        "cooldown_break_allowed": cooldown_break_allowed,
+    }
+    decision = {
+        "should_scan_candidates": should_scan,
+        "reason": reason,
+        "level": switch_level,
+        "switch_by": switch_by,
+        "delay_ms": delay,
+    }
+    return policy, decision, new_state
+
+
+def choose_quality_target(switch_check_target: str | None, targets: dict[str, str], confirm_target: str | None = None) -> str:
+    if confirm_target is not None:
+        if not confirm_target.strip():
+            raise ValueError("--confirm-target cannot be empty")
+        return confirm_target
+    if switch_check_target:
+        return switch_check_target
+    if "discord" in targets:
+        return "discord"
+    return "base"
+
+
+def result_quality_check(result: NodeResult, quality_target: str) -> CheckResult | None:
+    if quality_target == "base":
+        return result.base
+    return result.targets.get(quality_target)
+
+
+def level_rank(level: str) -> int | None:
+    ranks = {"poor": 1, "slow": 2, "good": 3}
+    return ranks.get(level)
+
+
+def comparable_delay(check: CheckResult | None) -> int | None:
+    if check is None or check.level in {"dead", "unknown", "missing"}:
+        return None
+    return check.delay
+
+
+def candidate_is_improved(
+    current_check: CheckResult | None,
+    candidate_check: CheckResult | None,
+    min_improvement_ms: int,
+) -> bool:
+    current_delay = comparable_delay(current_check)
+    current_rank = level_rank(current_check.level) if current_check is not None else None
+    candidate_delay = candidate_check.delay if candidate_check is not None else None
+    candidate_rank = level_rank(candidate_check.level) if candidate_check is not None else None
+    min_improvement_ms = max(0, int(min_improvement_ms))
+    improved_by_level = current_rank is not None and candidate_rank is not None and candidate_rank > current_rank
+    improved_by_delay = (
+        current_delay is not None
+        and candidate_delay is not None
+        and current_delay - candidate_delay >= min_improvement_ms
+    )
+    current_not_comparable = current_rank is None or current_delay is None
+    return current_not_comparable or improved_by_level or improved_by_delay
+
+
+def recent_switch_nodes(state: dict[str, Any], now: float, max_switches: int, window_seconds: int) -> set[str]:
+    max_switches = max(0, int(max_switches))
+    window_seconds = max(0, int(window_seconds))
+    if max_switches == 0 or window_seconds == 0:
+        return set()
+
+    events: list[dict[str, Any]] = []
+    last_switch = state.get("last_switch") if isinstance(state.get("last_switch"), dict) else None
+    if last_switch:
+        events.append(last_switch)
+    recent_switches = state.get("recent_switches")
+    if isinstance(recent_switches, list):
+        events.extend(event for event in recent_switches if isinstance(event, dict))
+
+    unique_events: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for event in events:
+        key = (event.get("at"), event.get("from_node"), event.get("to_node"))
+        unique_events[key] = event
+
+    filtered_events: list[tuple[float, dict[str, Any]]] = []
+    for event in unique_events.values():
+        try:
+            switched_at = float(event.get("at"))
+        except (TypeError, ValueError):
+            continue
+        if now - switched_at <= window_seconds:
+            filtered_events.append((switched_at, event))
+    filtered_events.sort(key=lambda item: item[0], reverse=True)
+
+    nodes: set[str] = set()
+    for _, event in filtered_events[:max_switches]:
+        for key in ("from_node", "to_node"):
+            node = event.get(key)
+            if isinstance(node, str) and node:
+                nodes.add(node)
+    return nodes
+
+
+def remember_recent_switch(state: dict[str, Any], switch_event: dict[str, Any]) -> None:
+    recent_switches = state.get("recent_switches")
+    if not isinstance(recent_switches, list):
+        recent_switches = []
+    recent_switches.append(dict(switch_event))
+    state["recent_switches"] = recent_switches[-50:]
+
+
 def choose_switch_target(
     node_results: list[NodeResult],
     current_node: str,
@@ -351,38 +640,60 @@ def choose_switch_target(
     proxies: dict[str, dict[str, Any]],
     switch_check_target: str | None,
     targets: dict[str, str],
-) -> NodeResult | None:
+    min_improvement_ms: int,
+    quality_target: str,
+    recent_nodes: set[str] | None = None,
+) -> tuple[NodeResult | None, dict[str, Any]]:
     allowed = set(proxies.get(switch_group, {}).get("all") or [])
-    sort_target = switch_check_target or ("discord" if "discord" in targets else None)
-    current_sort_delay = current_result.targets[sort_target].delay if sort_target and sort_target in current_result.targets else current_result.base.delay
+    recent_nodes = recent_nodes or set()
+    current_check = result_quality_check(current_result, quality_target)
+    min_improvement_ms = max(0, int(min_improvement_ms))
     candidates: list[NodeResult] = []
+    stats: dict[str, Any] = {
+        "quality_target": quality_target,
+        "min_improvement_ms": min_improvement_ms,
+        "scanned": 0,
+        "filtered_current": 0,
+        "filtered_not_allowed": 0,
+        "filtered_recent": 0,
+        "filtered_base_unavailable": 0,
+        "filtered_target_unavailable": 0,
+        "filtered_not_improved": 0,
+        "eligible": 0,
+    }
     for result in node_results:
         if result.name == current_node:
+            stats["filtered_current"] += 1
             continue
         if result.name not in allowed:
+            stats["filtered_not_allowed"] += 1
+            continue
+        stats["scanned"] += 1
+        if result.name in recent_nodes:
+            stats["filtered_recent"] += 1
             continue
         if not result.base.ok:
+            stats["filtered_base_unavailable"] += 1
             continue
-        if sort_target:
-            target_check = result.targets.get(sort_target)
-            if target_check is None or not target_check.ok:
-                continue
-            if current_sort_delay is not None and (target_check.delay is None or target_check.delay >= current_sort_delay):
-                continue
-        elif current_sort_delay is not None and (result.base.delay is None or result.base.delay >= current_sort_delay):
+        target_check = result_quality_check(result, quality_target)
+        if target_check is None or not target_check.ok:
+            stats["filtered_target_unavailable"] += 1
+            continue
+        if not candidate_is_improved(current_check, target_check, min_improvement_ms):
+            stats["filtered_not_improved"] += 1
             continue
         candidates.append(result)
     if not candidates:
-        return None
+        return None, stats
+
+    stats["eligible"] = len(candidates)
 
     def key(result: NodeResult) -> int:
-        if sort_target:
-            delay = result.targets[sort_target].delay
-        else:
-            delay = result.base.delay
+        check = result_quality_check(result, quality_target)
+        delay = check.delay if check is not None else None
         return delay if delay is not None else 10**9
 
-    return sorted(candidates, key=key)[0]
+    return sorted(candidates, key=key)[0], stats
 
 
 def summarize_results(node_results: list[NodeResult], targets: dict[str, str]) -> tuple[list[NodeResult], list[NodeResult], dict[str, list[NodeResult]], dict[str, list[NodeResult]]]:
@@ -427,7 +738,22 @@ def run_check(
     auto_switch_if_current_not_good: bool = False,
     switch_check_target: str | None = None,
     prefer_groups: list[str] | None = None,
+    state_file: str | None = DEFAULT_STATE_FILE,
+    bad_threshold: str = DEFAULT_BAD_THRESHOLD,
+    bad_confirm_count: int = DEFAULT_BAD_CONFIRM_COUNT,
+    slow_switch_threshold_ms: int = DEFAULT_SLOW_SWITCH_THRESHOLD_MS,
+    slow_confirm_count: int = DEFAULT_SLOW_CONFIRM_COUNT,
+    switch_cooldown_seconds: int = DEFAULT_SWITCH_COOLDOWN_SECONDS,
+    break_cooldown_dead_count: int = DEFAULT_BREAK_COOLDOWN_DEAD_COUNT,
+    min_improvement_ms: int = DEFAULT_MIN_IMPROVEMENT_MS,
+    confirm_candidate: bool = False,
+    confirm_target: str | None = None,
+    avoid_recent_switches: int = DEFAULT_AVOID_RECENT_SWITCHES,
+    avoid_recent_window_seconds: int = DEFAULT_AVOID_RECENT_WINDOW_SECONDS,
+    now: float | None = None,
 ) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    bad_threshold = normalize_bad_threshold(bad_threshold)
     proxies = client.get_json("/proxies")["proxies"]
     original_groups = snapshot_strategy_groups(proxies)
     us_nodes = [name for name, proxy in proxies.items() if is_us_real_node(name, proxy)]
@@ -435,8 +761,11 @@ def run_check(
     allowed_changes: dict[str, str] = {}
     node_results: list[NodeResult] = []
 
+    quality_target = choose_quality_target(switch_check_target, targets, confirm_target)
     if switch_check_target and switch_check_target not in targets:
         raise ValueError(f"--switch-check-target not present in targets: {switch_check_target}")
+    if quality_target != "base" and quality_target not in targets:
+        raise ValueError(f"--confirm-target not present in targets: {quality_target}")
 
     current_node_info: dict[str, Any] = {"detected": False, "group": None, "name": None, "via": None}
     auto_switch: dict[str, Any] = {
@@ -447,15 +776,60 @@ def run_check(
         "triggered": False,
         "reason": "disabled" if not auto_switch_if_current_not_good else None,
         "check_target": switch_check_target,
+        "candidate_quality_target": quality_target,
         "from_group": None,
         "from_node": None,
         "to_node": None,
+        "candidate_filter": None,
+        "candidate_confirmation": None,
         "status": "disabled" if not auto_switch_if_current_not_good else "pending",
+    }
+    switch_policy: dict[str, Any] = {
+        "enabled": auto_switch_if_current_not_good,
+        "state_file": state_file,
+        "bad_threshold": bad_threshold,
+        "bad_confirm_count": _positive(bad_confirm_count),
+        "slow_switch_threshold_ms": slow_switch_threshold_ms,
+        "slow_confirm_count": _positive(slow_confirm_count),
+        "switch_cooldown_seconds": max(0, switch_cooldown_seconds),
+        "break_cooldown_dead_count": _positive(break_cooldown_dead_count),
+        "min_improvement_ms": max(0, int(min_improvement_ms)),
+        "confirm_candidate": bool(confirm_candidate),
+        "confirm_target": quality_target,
+        "avoid_recent_switches": max(0, int(avoid_recent_switches)),
+        "avoid_recent_window_seconds": max(0, int(avoid_recent_window_seconds)),
+    }
+    switch_decision: dict[str, Any] = {
+        "should_scan_candidates": False,
+        "reason": "disabled" if not auto_switch_if_current_not_good else "pending",
     }
 
     if auto_switch_if_current_not_good:
+        switch_state, state_load_error = load_switch_state(state_file)
+        switch_policy["state_load_error"] = state_load_error
         current_node_info = detect_current_node(proxies, original_groups, us_nodes, prefer_groups)
         if not current_node_info.get("detected"):
+            policy, decision, next_state = decide_switch_policy(
+                switch_state,
+                now=now,
+                current_group=None,
+                current_node=None,
+                switch_by="current_node:missing",
+                switch_level="missing",
+                check=None,
+                state_load_error=state_load_error,
+                bad_threshold=bad_threshold,
+                bad_confirm_count=bad_confirm_count,
+                slow_switch_threshold_ms=slow_switch_threshold_ms,
+                slow_confirm_count=slow_confirm_count,
+                switch_cooldown_seconds=switch_cooldown_seconds,
+                break_cooldown_dead_count=break_cooldown_dead_count,
+            )
+            switch_policy.update(policy)
+            switch_decision.update(decision)
+            state_save_error = save_switch_state(state_file, next_state)
+            if state_save_error:
+                switch_policy["state_save_error"] = state_save_error
             auto_switch.update({"reason": current_node_info.get("reason", "current_node_not_detected"), "status": "skipped"})
             append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups))
         else:
@@ -473,6 +847,27 @@ def run_check(
             )
             node_results.append(current_result)
             needs_switch, switch_by, switch_level = current_needs_switch(current_result, switch_check_target)
+            switch_check, _ = current_switch_check(current_result, switch_check_target)
+            current_quality_check = result_quality_check(current_result, quality_target)
+            policy, decision, next_state = decide_switch_policy(
+                switch_state,
+                now=now,
+                current_group=current_group,
+                current_node=current_name,
+                switch_by=switch_by,
+                switch_level=switch_level,
+                check=switch_check,
+                state_load_error=state_load_error,
+                bad_threshold=bad_threshold,
+                bad_confirm_count=bad_confirm_count,
+                slow_switch_threshold_ms=slow_switch_threshold_ms,
+                slow_confirm_count=slow_confirm_count,
+                switch_cooldown_seconds=switch_cooldown_seconds,
+                break_cooldown_dead_count=break_cooldown_dead_count,
+            )
+            switch_policy.update(policy)
+            switch_decision.update(decision)
+            switch_decision["current_needs_switch"] = needs_switch
             current_node_info.update({
                 "base": current_result.base.as_json(),
                 "targets": {name: check.as_json() for name, check in current_result.targets.items()},
@@ -483,17 +878,26 @@ def run_check(
                 "switch_level": switch_level,
             })
             auto_switch.update({"from_group": current_group, "from_node": current_name})
-            if not needs_switch:
+            if not decision["should_scan_candidates"]:
+                state_save_error = save_switch_state(state_file, next_state)
+                if state_save_error:
+                    switch_policy["state_save_error"] = state_save_error
                 auto_switch.update({
                     "candidate_scan_started": False,
-                    "candidate_scan_reason": "current_node_good",
+                    "candidate_scan_reason": decision["reason"],
                     "triggered": False,
-                    "reason": "current_node_good",
+                    "reason": decision["reason"],
                     "status": "not_needed",
                 })
                 append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups))
             else:
-                auto_switch.update({"candidate_scan_started": True, "candidate_scan_reason": f"current_node_{switch_level}"})
+                auto_switch.update({"candidate_scan_started": True, "candidate_scan_reason": decision["reason"]})
+                recent_nodes = recent_switch_nodes(
+                    switch_state,
+                    now,
+                    avoid_recent_switches,
+                    avoid_recent_window_seconds,
+                )
                 allowed_for_switch_group = set(proxies.get(current_group, {}).get("all") or [])
                 candidate_nodes = [
                     node
@@ -513,30 +917,120 @@ def run_check(
                             restore_events,
                         )
                     )
-                best = choose_switch_target(node_results, current_name, current_result, current_group, proxies, switch_check_target, targets)
+                best, candidate_filter = choose_switch_target(
+                    node_results,
+                    current_name,
+                    current_result,
+                    current_group,
+                    proxies,
+                    switch_check_target,
+                    targets,
+                    min_improvement_ms,
+                    quality_target,
+                    recent_nodes,
+                )
+                candidate_filter["recent_nodes"] = sorted(recent_nodes)
+                auto_switch["candidate_filter"] = candidate_filter
+                switch_decision["candidate_filter"] = candidate_filter
                 if best is None:
+                    state_save_error = save_switch_state(state_file, next_state)
+                    if state_save_error:
+                        switch_policy["state_save_error"] = state_save_error
                     auto_switch.update({"triggered": False, "reason": "no_available_candidate", "status": "skipped"})
                     append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups))
                 else:
-                    client.put_json(f"/proxies/{enc(current_group)}", {"name": best.name})
-                    after = client.get_json(f"/proxies/{enc(current_group)}").get("now")
-                    if after == best.name:
-                        allowed_changes[current_group] = best.name
-                        auto_switch.update({
-                            "triggered": True,
-                            "reason": f"current_node_{switch_level}_by_{switch_by}",
-                            "to_node": best.name,
-                            "status": "success",
-                        })
+                    if confirm_candidate:
+                        confirmation = check_node(
+                            client,
+                            best.name,
+                            base_url,
+                            timeout_ms,
+                            {quality_target: targets[quality_target]} if quality_target != "base" else {},
+                            target_timeout_ms,
+                            original_groups,
+                            restore_events,
+                        )
+                        confirmed_check = result_quality_check(confirmation, quality_target)
+                        confirmation_json = {
+                            "enabled": True,
+                            "target": quality_target,
+                            "node": best.name,
+                            "base": confirmation.base.as_json(),
+                            "check": confirmed_check.as_json() if confirmed_check is not None else None,
+                            "passed": bool(confirmation.base.ok and confirmed_check is not None and confirmed_check.ok),
+                        }
+                        if confirmation_json["passed"] and not candidate_is_improved(
+                            current_quality_check,
+                            confirmed_check,
+                            min_improvement_ms,
+                        ):
+                            confirmation_json["passed"] = False
+                            confirmation_json["reason"] = "candidate_confirmation_not_improved"
+                        auto_switch["candidate_confirmation"] = confirmation_json
+                        switch_decision["candidate_confirmation"] = confirmation_json
+                        if not confirmation_json["passed"]:
+                            state_save_error = save_switch_state(state_file, next_state)
+                            if state_save_error:
+                                switch_policy["state_save_error"] = state_save_error
+                            reason = confirmation_json.get("reason", "candidate_confirmation_failed")
+                            auto_switch.update({
+                                "triggered": False,
+                                "reason": reason,
+                                "status": "skipped",
+                            })
+                            append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups))
+                            best = None
                     else:
-                        auto_switch.update({
-                            "triggered": True,
-                            "reason": f"current_node_{switch_level}_by_{switch_by}",
-                            "to_node": best.name,
-                            "status": "failed",
-                            "error": f"switch verification failed: now={after}",
-                        })
-                    append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups, allowed_changes))
+                        confirmation_json = {"enabled": False, "target": quality_target, "node": best.name, "passed": None}
+                        auto_switch["candidate_confirmation"] = confirmation_json
+                        switch_decision["candidate_confirmation"] = confirmation_json
+                    if best is not None:
+                        client.put_json(f"/proxies/{enc(current_group)}", {"name": best.name})
+                        after = client.get_json(f"/proxies/{enc(current_group)}").get("now")
+                        if after == best.name:
+                            allowed_changes[current_group] = best.name
+                            switch_event = {
+                                "at": now,
+                                "from_group": current_group,
+                                "from_node": current_name,
+                                "to_node": best.name,
+                                "reason": decision["reason"],
+                            }
+                            next_state["last_switch"] = switch_event
+                            remember_recent_switch(next_state, switch_event)
+                            next_state["current"] = {
+                                "key": f"{current_group}\n{best.name}\n{switch_by}",
+                                "group": current_group,
+                                "node": best.name,
+                                "switch_by": switch_by,
+                                "level": "switched",
+                                "delay_ms": None,
+                                "bad_count": 0,
+                                "slow_count": 0,
+                                "dead_count": 0,
+                                "updated_at": now,
+                            }
+                            state_save_error = save_switch_state(state_file, next_state)
+                            if state_save_error:
+                                switch_policy["state_save_error"] = state_save_error
+                            auto_switch.update({
+                                "triggered": True,
+                                "reason": decision["reason"],
+                                "to_node": best.name,
+                                "status": "success",
+                            })
+                        else:
+                            state_save_error = save_switch_state(state_file, next_state)
+                            if state_save_error:
+                                switch_policy["state_save_error"] = state_save_error
+                            auto_switch.update({
+                                "triggered": True,
+                                "reason": decision["reason"],
+                                "to_node": best.name,
+                                "status": "failed",
+                                "error": f"switch verification failed: now={after}",
+                            })
+                        append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups, allowed_changes))
     else:
         for node in us_nodes:
             node_results.append(
@@ -583,6 +1077,8 @@ def run_check(
         },
         "current_node": current_node_info,
         "auto_switch": auto_switch,
+        "switch_policy": switch_policy,
+        "switch_decision": switch_decision,
         "restore_events": restore_events,
         "allowed_changes": allowed_changes_list,
         "still_changed": still_changed,
@@ -594,6 +1090,27 @@ def parse_prefer_groups(raw: str | None) -> list[str]:
     if not raw:
         return DEFAULT_PREFER_GROUPS
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _format_counter(value: Any, total: Any) -> str:
+    return f"{value}/{total}"
+
+
+def _print_candidate_filter(stats: dict[str, Any] | None) -> None:
+    if not stats:
+        print("候选过滤: 未扫描")
+        return
+    print(
+        "候选过滤: "
+        f"扫描 {stats.get('scanned', 0)}，"
+        f"可用 {stats.get('eligible', 0)}，"
+        f"当前节点 {stats.get('filtered_current', 0)}，"
+        f"不在策略组 {stats.get('filtered_not_allowed', 0)}，"
+        f"近期切换 {stats.get('filtered_recent', 0)}，"
+        f"基础不可用 {stats.get('filtered_base_unavailable', 0)}，"
+        f"目标不可用 {stats.get('filtered_target_unavailable', 0)}，"
+        f"改善不足 {stats.get('filtered_not_improved', 0)}"
+    )
 
 
 def print_human(result: dict[str, Any]) -> None:
@@ -614,13 +1131,35 @@ def print_human(result: dict[str, Any]) -> None:
     print(f"自动切换模式: {'开启' if result['auto_switch']['enabled'] else '关闭'}")
     if result["auto_switch"]["enabled"]:
         cn = result["current_node"]
+        policy = result.get("switch_policy", {})
+        decision = result.get("switch_decision", {})
         print(f"当前节点识别: {'成功' if cn.get('detected') else '失败'}")
         if cn.get("detected"):
             print(f"当前策略组: {cn.get('group')}")
             print(f"当前节点: {cn.get('name')}")
             print(f"当前节点基础状态: {'dead' if cn.get('dead') else 'alive'} ({cn.get('dead_by')})")
             print(f"当前节点需要切换: {cn.get('needs_switch')} ({cn.get('switch_by')}={cn.get('switch_level')})")
+        print(f"切换判断目标: {result['auto_switch'].get('candidate_quality_target')}")
+        print(f"决策原因: {decision.get('reason')}")
+        print(f"计数器 bad: {_format_counter(policy.get('bad_count', 0), policy.get('bad_confirm_count', 0))}")
+        print(f"计数器 slow: {_format_counter(policy.get('slow_count', 0), policy.get('slow_confirm_count', 0))}")
+        print(f"计数器 dead: {_format_counter(policy.get('dead_count', 0), policy.get('break_cooldown_dead_count', 0))}")
+        print(
+            "冷却状态: "
+            f"{'生效' if policy.get('in_cooldown') else '未生效'}，"
+            f"剩余 {policy.get('cooldown_remaining_seconds', 0)} 秒，"
+            f"允许打破冷却: {policy.get('cooldown_break_allowed')}"
+        )
         print(f"是否扫描候选节点: {result['auto_switch'].get('candidate_scan_started')}")
+        _print_candidate_filter(result["auto_switch"].get("candidate_filter"))
+        confirmation = result["auto_switch"].get("candidate_confirmation")
+        if confirmation:
+            print(
+                "候选复测: "
+                f"{'开启' if confirmation.get('enabled') else '关闭'}，"
+                f"目标 {confirmation.get('target')}，"
+                f"结果 {confirmation.get('passed')}"
+            )
         print(f"自动切换结果: {result['auto_switch'].get('status')} / {result['auto_switch'].get('reason')}")
         if result["auto_switch"].get("to_node"):
             print(f"切换目标: {result['auto_switch']['to_node']}")
@@ -683,6 +1222,18 @@ def main() -> int:
     parser.add_argument("--no-default-targets", action="store_true", help="do not include built-in default target APIs")
     parser.add_argument("--auto-switch-if-current-not-good", action="store_true", help="current-first mode: switch to best US node when current check level is not good")
     parser.add_argument("--switch-check-target", help="target name used to decide current quality and choose best node, e.g. discord")
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"auto-switch state file; default: {DEFAULT_STATE_FILE}")
+    parser.add_argument("--bad-threshold", default=DEFAULT_BAD_THRESHOLD, choices=["poor"], help=f"level treated as bad for confirmation; default: {DEFAULT_BAD_THRESHOLD}")
+    parser.add_argument("--bad-confirm-count", type=int, default=DEFAULT_BAD_CONFIRM_COUNT, help=f"consecutive poor/dead/unknown checks before scanning candidates; default: {DEFAULT_BAD_CONFIRM_COUNT}")
+    parser.add_argument("--slow-switch-threshold-ms", type=int, default=DEFAULT_SLOW_SWITCH_THRESHOLD_MS, help=f"slow delay in ms that may trigger switching after confirmation; default: {DEFAULT_SLOW_SWITCH_THRESHOLD_MS}")
+    parser.add_argument("--slow-confirm-count", type=int, default=DEFAULT_SLOW_CONFIRM_COUNT, help=f"consecutive slow checks above threshold before scanning candidates; default: {DEFAULT_SLOW_CONFIRM_COUNT}")
+    parser.add_argument("--switch-cooldown-seconds", type=int, default=DEFAULT_SWITCH_COOLDOWN_SECONDS, help=f"minimum seconds between successful switches; default: {DEFAULT_SWITCH_COOLDOWN_SECONDS}")
+    parser.add_argument("--break-cooldown-dead-count", type=int, default=DEFAULT_BREAK_COOLDOWN_DEAD_COUNT, help=f"consecutive dead checks allowed to break switch cooldown; default: {DEFAULT_BREAK_COOLDOWN_DEAD_COUNT}")
+    parser.add_argument("--min-improvement-ms", type=int, default=DEFAULT_MIN_IMPROVEMENT_MS, help=f"minimum delay improvement required for same-level candidates; default: {DEFAULT_MIN_IMPROVEMENT_MS}")
+    parser.add_argument("--confirm-candidate", action="store_true", help="re-test the selected candidate before switching")
+    parser.add_argument("--confirm-target", help="target name used for candidate quality and confirmation; default: switch target, discord, then base")
+    parser.add_argument("--avoid-recent-switches", type=int, default=DEFAULT_AVOID_RECENT_SWITCHES, help=f"number of recent switch events whose nodes are filtered; default: {DEFAULT_AVOID_RECENT_SWITCHES}")
+    parser.add_argument("--avoid-recent-window-seconds", type=int, default=DEFAULT_AVOID_RECENT_WINDOW_SECONDS, help=f"recent switch filter window in seconds; default: {DEFAULT_AVOID_RECENT_WINDOW_SECONDS}")
     parser.add_argument("--prefer-groups", help="comma-separated strategy group priority for current-node detection")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of human-readable text")
     args = parser.parse_args()
@@ -692,6 +1243,9 @@ def main() -> int:
         targets = build_targets(args)
         if args.switch_check_target and args.switch_check_target not in targets:
             raise ValueError(f"--switch-check-target not present in targets: {args.switch_check_target}")
+        confirm_target = choose_quality_target(args.switch_check_target, targets, args.confirm_target)
+        if confirm_target != "base" and confirm_target not in targets:
+            raise ValueError(f"--confirm-target not present in targets: {confirm_target}")
         client = MihomoUnixClient(args.socket)
         result = run_check(
             client=client,
@@ -702,6 +1256,18 @@ def main() -> int:
             auto_switch_if_current_not_good=args.auto_switch_if_current_not_good,
             switch_check_target=args.switch_check_target,
             prefer_groups=parse_prefer_groups(args.prefer_groups),
+            state_file=args.state_file,
+            bad_threshold=args.bad_threshold,
+            bad_confirm_count=args.bad_confirm_count,
+            slow_switch_threshold_ms=args.slow_switch_threshold_ms,
+            slow_confirm_count=args.slow_confirm_count,
+            switch_cooldown_seconds=args.switch_cooldown_seconds,
+            break_cooldown_dead_count=args.break_cooldown_dead_count,
+            min_improvement_ms=args.min_improvement_ms,
+            confirm_candidate=args.confirm_candidate,
+            confirm_target=args.confirm_target,
+            avoid_recent_switches=args.avoid_recent_switches,
+            avoid_recent_window_seconds=args.avoid_recent_window_seconds,
         )
     except Exception as exc:
         if args.json:

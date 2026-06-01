@@ -280,8 +280,11 @@ GLOBAL
 
 - 默认使用基础状态的延迟等级判断当前节点质量。
 - 如果启用了 `--switch-check-target 目标名`，则以指定目标 API 的延迟等级判断当前节点质量，例如 `discord.level=slow` 视为需要切换。
-- 只有判断目标的等级为 `good` 时，当前节点才不触发候选扫描。
-- 判断目标的等级为 `slow`、`poor`、`dead`、`missing` 时，当前节点需要进入候选扫描。
+- 只有判断目标的等级为 `good` 时，当前节点才明确不需要扫描候选，并应重置连续异常计数。
+- 判断目标为可接受的 `slow` 时，当前节点不得进入候选扫描。
+- 判断目标为超阈值 `slow` 时，需要先达到 `--slow-confirm-count`，再按冷却策略决定是否进入候选扫描。
+- 判断目标为 `poor`、`dead`、`unknown` 或 `missing` 时，需要先达到 `--bad-confirm-count`，再按冷却策略决定是否进入候选扫描。
+- 冷却期内默认不得扫描候选；只有连续真实 `dead` 达到 `--break-cooldown-dead-count` 时，才允许提前打破冷却。
 - 如果同时要求基础状态和目标 API 状态都可用，可以支持 `--switch-require base,target:discord` 形式；默认只使用基础状态判断。
 
 ## 自动切换最优节点需求
@@ -300,14 +303,14 @@ GLOBAL
 2. 脚本先识别当前正在使用的美国节点及其所属可切换策略组。
 3. 脚本只对当前节点执行基础状态和必要目标 API 检测。
 4. 如果当前节点等级为 `good`，脚本立即结束自动切换流程，不检测其它候选节点，不切换。
-5. 只有当前节点检测等级不是 `good` 时，脚本才开始检测其它美国候选节点。
-6. 如果存在满足条件且延迟更低的候选节点，则切换到最优可用节点。
+5. 当前节点检测等级不是 `good` 时，脚本仍必须先经过 slow 阈值、连续确认和冷却策略判断；只有策略允许时才开始检测其它美国候选节点。
+6. 如果存在满足条件且相对当前节点明显更好的候选节点，则切换到最优可用节点。
 
 触发条件：
 
 1. 用户显式传入 `--auto-switch-if-current-not-good`。
 2. 成功识别当前美国节点及其所属可切换策略组。
-3. 当前节点检测等级不是 `good`。
+3. 当前节点检测等级达到 slow 或 bad 的连续确认条件，并且未被冷却策略阻止。
 4. 存在至少一个候选美国节点满足最优节点筛选条件。
 
 不得触发切换的情况：
@@ -424,7 +427,8 @@ Content-Type: application/json
 
 - 自动切换模式采用懒检测：先只检测当前节点。
 - 当前节点等级为 `good` 时，不检测其它美国节点，不做任何切换。
-- 只有当前节点等级不是 `good` 时，才检测其它美国候选节点并选择更优节点。
+- 当前节点等级不是 `good` 时，仍必须先经过 slow 阈值、连续确认和冷却判断；只有策略允许时才检测其它美国候选节点。
+- 候选节点必须通过基础可用性、目标可用性、近期切换过滤和明显改善规则；启用候选复测时，复测结果也必须仍然满足明显改善规则，才允许切换。
 - 自动切换目标策略组的 `now` 允许从原当前节点变为最优节点。
 - 其他策略组仍必须保持原样，除非它们原本就是同一个待切换策略组。
 - `still_changed` 不应把被允许的自动切换视为异常。
@@ -440,10 +444,14 @@ Content-Type: application/json
 自动切换模式，即传入 `--auto-switch-if-current-not-good` 时：
 
 - 第一阶段只检测当前正在使用的美国节点。
-- 如果当前节点等级为 `good`，脚本不得继续检测其它美国节点。
-- 如果当前节点等级不是 `good`，第二阶段才检测其它美国候选节点。
+- 如果当前节点等级为 `good`，脚本不得继续检测其它美国节点，并重置连续异常计数。
+- 如果当前节点为可接受的 `slow`，脚本不得继续检测其它美国节点。
+- 如果当前节点为超阈值 `slow`，需要达到 `--slow-confirm-count` 后才进入第二阶段。
+- 如果当前节点为 `poor`、`dead`、`unknown` 或 `missing`，需要达到 `--bad-confirm-count` 后才进入第二阶段。
+- 如果仍处于切换冷却期，默认不得进入第二阶段；只有连续 `dead` 达到 `--break-cooldown-dead-count` 时，才允许提前打破冷却。
 - 第二阶段候选节点应排除当前节点。
 - 第二阶段候选节点仍必须来自 `/proxies` 全量池过滤结果，且必须在目标可切换策略组 `all` 列表中。
+- 第二阶段候选节点必须通过基础可用性、目标可用性、近期切换过滤和改善阈值过滤。
 
 JSON 输出中应体现检测范围：
 
@@ -457,14 +465,14 @@ JSON 输出中应体现检测范围：
 }
 ```
 
-当当前节点 slow / poor / dead / missing 时：
+当当前节点达到连续确认条件并通过冷却判断时：
 
 ```json
 {
   "auto_switch": {
     "mode": "current-first",
     "candidate_scan_started": true,
-    "candidate_scan_reason": "current_node_slow"
+    "candidate_scan_reason": "bad_confirmed"
   }
 }
 ```
@@ -486,8 +494,9 @@ JSON 输出中应体现检测范围：
 11. 当前节点识别结果。
 12. 自动切换模式是否启用。
 13. 如果启用自动切换：第一阶段当前节点检测结果、是否开始候选扫描、是否触发切换、切换原因、原节点、目标节点、执行结果。
-14. 切换保护结果。
-15. 最终策略组状态是否符合预期。
+14. 如果启用自动切换：连续异常计数器、冷却剩余时间、候选过滤数量和候选复测结果。
+15. 切换保护结果。
+16. 最终策略组状态是否符合预期。
 
 ## JSON 输出要求
 
@@ -508,9 +517,9 @@ JSON 输出中应体现检测范围：
   "nodes": [
     {
       "name": "节点名",
-      "base": {"ok": true, "delay_ms": 183, "error": ""},
+      "base": {"ok": true, "delay_ms": 183, "level": "good", "error": ""},
       "targets": {
-        "discord": {"ok": true, "delay_ms": 210, "error": ""}
+        "discord": {"ok": true, "delay_ms": 210, "level": "good", "error": ""}
       }
     }
   ],
@@ -548,14 +557,77 @@ JSON 输出中应体现检测范围：
     "enabled": true,
     "mode": "current-first",
     "candidate_scan_started": true,
-    "candidate_scan_reason": "current_node_slow",
+    "candidate_scan_reason": "bad_confirmed",
     "triggered": true,
-    "reason": "current_node_slow_by_target:discord",
+    "reason": "bad_confirmed",
     "check_target": "discord",
+    "candidate_quality_target": "discord",
     "from_group": "🔰 代理",
     "from_node": "🇺🇸 Lil 美国03",
     "to_node": "🇺🇸 Lil 美国01",
+    "candidate_filter": {
+      "quality_target": "discord",
+      "min_improvement_ms": 100,
+      "scanned": 12,
+      "filtered_current": 1,
+      "filtered_not_allowed": 0,
+      "filtered_recent": 1,
+      "filtered_base_unavailable": 2,
+      "filtered_target_unavailable": 3,
+      "filtered_not_improved": 4,
+      "eligible": 2,
+      "recent_nodes": ["🇺🇸 Lil 美国02"]
+    },
+    "candidate_confirmation": {
+      "enabled": true,
+      "target": "discord",
+      "node": "🇺🇸 Lil 美国01",
+      "base": {"ok": true, "delay_ms": 180, "level": "good", "error": ""},
+      "check": {"ok": true, "delay_ms": 210, "level": "good", "error": ""},
+      "passed": true
+    },
     "status": "success"
+  },
+  "switch_policy": {
+    "enabled": true,
+    "state_file": "logs/auto_switch_state.json",
+    "state_load_error": null,
+    "bad_threshold": "poor",
+    "bad_confirm_count": 2,
+    "slow_switch_threshold_ms": 600,
+    "slow_confirm_count": 5,
+    "switch_cooldown_seconds": 600,
+    "break_cooldown_dead_count": 3,
+    "min_improvement_ms": 100,
+    "confirm_candidate": true,
+    "confirm_target": "discord",
+    "avoid_recent_switches": 3,
+    "avoid_recent_window_seconds": 1800,
+    "bad_count": 2,
+    "slow_count": 0,
+    "dead_count": 0,
+    "required_count": 2,
+    "observed_count": 2,
+    "in_cooldown": false,
+    "cooldown_remaining_seconds": 0,
+    "cooldown_break_allowed": false
+  },
+  "switch_decision": {
+    "should_scan_candidates": true,
+    "reason": "bad_confirmed",
+    "level": "poor",
+    "switch_by": "target:discord",
+    "delay_ms": 910,
+    "current_needs_switch": true,
+    "candidate_filter": {
+      "quality_target": "discord",
+      "eligible": 2
+    },
+    "candidate_confirmation": {
+      "enabled": true,
+      "target": "discord",
+      "passed": true
+    }
   },
   "restore_events": [],
   "allowed_changes": [],
@@ -584,6 +656,18 @@ JSON 输出中应体现检测范围：
 --no-default-targets           不加载默认目标 API
 --auto-switch-if-current-not-good 当前节点等级不是 good 时切换到更优可用节点，默认关闭
 --switch-check-target             用于判断当前质量和选择最优节点的目标名，例如 discord
+--state-file                   自动切换状态文件，默认 logs/auto_switch_state.json
+--bad-threshold                进入 bad 确认逻辑的等级，目前固定支持 poor
+--bad-confirm-count            poor/dead/unknown/missing 连续确认次数，默认 2
+--slow-switch-threshold-ms     slow 延迟超过该值后才累计 slow 计数，默认 600
+--slow-confirm-count           slow 超阈值后的连续确认次数，默认 5
+--switch-cooldown-seconds      成功切换后的冷却时间，默认 600
+--break-cooldown-dead-count    冷却期内允许提前切换的连续 dead 次数，默认 3
+--min-improvement-ms           同等级候选需要达到的最小延迟改善，默认 100
+--confirm-candidate            切换前复测选中的候选节点
+--confirm-target               候选质量与复测目标，默认 switch 目标、discord、base
+--avoid-recent-switches        近期切换过滤检查的事件数量，默认 3
+--avoid-recent-window-seconds  近期切换过滤时间窗口，默认 1800
 --prefer-groups                当前节点所属策略组优先级，逗号分隔
 --json                         输出 JSON
 ```
@@ -600,7 +684,7 @@ JSON 输出中应体现检测范围：
 ## 当前实现文件
 
 ```text
-/Users/jojo/workspace/auto-check-node/check_us_proxy_status.py
+check_us_proxy_status.py
 ```
 
 ## 当前验证要求
@@ -608,13 +692,13 @@ JSON 输出中应体现检测范围：
 修改后至少验证：
 
 ```bash
-/Users/jojo/workspace/auto-check-node/check_us_proxy_status.py --json
+./check_us_proxy_status.py --json
 ```
 
 以及：
 
 ```bash
-/Users/jojo/workspace/auto-check-node/check_us_proxy_status.py \
+./check_us_proxy_status.py \
   --no-default-targets \
   --target discord=https://discord.com/api/v10/gateway \
   --json
@@ -623,7 +707,7 @@ JSON 输出中应体现检测范围：
 自动切换功能修改后还需验证：
 
 ```bash
-/Users/jojo/workspace/auto-check-node/check_us_proxy_status.py \
+./check_us_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord \
   --json
@@ -639,7 +723,8 @@ target_alive.discord + target_dead.discord 数量等于 us_nodes_count
 current_node 字段存在且能说明是否识别成功
 未启用自动切换时 guarantee = unchanged
 启用自动切换但当前节点等级为 good 时 auto_switch.triggered=false、auto_switch.candidate_scan_started=false 且 guarantee=unchanged
-启用自动切换且当前节点等级不是 good 时，auto_switch.candidate_scan_started=true；若存在延迟更低的可用候选，则 auto_switch.triggered=true 且 guarantee=changed_as_requested
+启用自动切换且当前节点达到连续确认条件、未被冷却阻止时，auto_switch.candidate_scan_started=true；若存在通过过滤和复测的可用候选，则 auto_switch.triggered=true 且 guarantee=changed_as_requested
+启用自动切换时，switch_policy 和 switch_decision 字段存在，并能说明计数器、冷却状态、候选过滤数量和候选复测结果
 restore_events 可为空或包含已恢复事件
 still_changed 为空，或只包含允许的自动切换变化
 退出码符合执行结果
