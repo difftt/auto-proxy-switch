@@ -1220,7 +1220,11 @@ def main() -> int:
     parser.add_argument("--target", action="append", help="target API to test, format name=URL; repeatable")
     parser.add_argument("--target-timeout", type=int, default=8000, help="target API timeout in ms; default: 8000")
     parser.add_argument("--no-default-targets", action="store_true", help="do not include built-in default target APIs")
-    parser.add_argument("--auto-switch-if-current-not-good", action="store_true", help="current-first mode: switch to best US node when current check level is not good")
+    parser.add_argument(
+        "--auto-switch-if-current-not-good",
+        action="store_true",
+        help="current-first mode: scan and switch only after policy confirmation and cooldown checks allow it",
+    )
     parser.add_argument("--switch-check-target", help="target name used to decide current quality and choose best node, e.g. discord")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"auto-switch state file; default: {DEFAULT_STATE_FILE}")
     parser.add_argument("--bad-threshold", default=DEFAULT_BAD_THRESHOLD, choices=["poor"], help=f"level treated as bad for confirmation; default: {DEFAULT_BAD_THRESHOLD}")

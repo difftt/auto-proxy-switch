@@ -84,7 +84,7 @@ poor: 连续 2 次确认后扫描候选
 dead / unknown / missing: 连续 2 次确认后扫描候选；冷却期内连续 dead 3 次可提前打破冷却
 ```
 
-切换成功后默认进入 600 秒冷却期。冷却期内，`slow` 和 `poor` 只更新计数器，不执行新的切换。
+切换成功后默认进入 600 秒冷却期。冷却期内除连续 dead 达到打破条件外，只更新计数器，不执行新的切换。
 
 候选节点必须同时满足：
 
@@ -188,7 +188,7 @@ JSON 中 `base` 和每个 `targets` 检测结果都会包含 `level`：
 --target-timeout               目标 API 单节点检测超时时间，单位 ms
 --no-default-targets           不加载默认目标 API
 --auto-switch-if-current-not-good
-                               当前节点达到策略确认条件时尝试自动切换
+                               当前节点达到策略确认条件且未被冷却阻止时尝试自动切换
 --switch-check-target          用于判断当前质量和选择最优节点的目标名
 --state-file                   自动切换状态文件，默认 logs/auto_switch_state.json
 --bad-threshold                进入 bad 确认逻辑的等级，目前固定支持 poor
