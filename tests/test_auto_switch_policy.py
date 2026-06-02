@@ -10,7 +10,10 @@ from unittest.mock import patch
 
 from check_us_proxy_status import (
     CheckResult,
+    OPENAI_TARGET_NAME,
+    OPENAI_TARGET_URL,
     REGION_KEYWORDS,
+    build_targets,
     decide_switch_policy,
     is_region_real_node,
     is_us_real_node,
@@ -77,6 +80,7 @@ class FakeClient:
 
 def run_fake(client, state_file, **kwargs):
     targets = kwargs.pop("targets", {})
+    switch_check_target = kwargs.pop("switch_check_target", None)
     return run_check(
         client=client,
         base_url="http://example.test/204",
@@ -84,7 +88,7 @@ def run_fake(client, state_file, **kwargs):
         targets=targets,
         target_timeout_ms=1000,
         auto_switch_if_current_not_good=True,
-        switch_check_target=None,
+        switch_check_target=switch_check_target,
         prefer_groups=["🔰 代理"],
         state_file=str(state_file),
         now=1000.0,
@@ -93,6 +97,31 @@ def run_fake(client, state_file, **kwargs):
 
 
 class AutoSwitchPolicyTest(unittest.TestCase):
+    def test_openai_target_is_explicit_and_not_loaded_by_default(self):
+        class Args:
+            no_default_targets = False
+            target = None
+
+        self.assertEqual({"discord": "https://discord.com/api/v10/gateway"}, build_targets(Args))
+
+        Args.target = [OPENAI_TARGET_NAME]
+        self.assertEqual(
+            {
+                "discord": "https://discord.com/api/v10/gateway",
+                OPENAI_TARGET_NAME: OPENAI_TARGET_URL,
+            },
+            build_targets(Args),
+        )
+
+        Args.target = [f"{OPENAI_TARGET_NAME}={OPENAI_TARGET_URL}"]
+        self.assertEqual(
+            {
+                "discord": "https://discord.com/api/v10/gateway",
+                OPENAI_TARGET_NAME: OPENAI_TARGET_URL,
+            },
+            build_targets(Args),
+        )
+
     def test_region_keywords_cover_supported_regions(self):
         self.assertEqual({"us", "sg", "uk", "jp", "hk", "de", "fr"}, set(REGION_KEYWORDS))
         self.assertEqual(("🇺🇸", "美国", "US", "USA", "United States"), REGION_KEYWORDS["us"])
@@ -147,6 +176,31 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         )
         self.assertEqual(2, result["region_nodes_count"])
 
+    def test_run_check_reports_openai_target_status_when_explicitly_configured(self):
+        base_url = "http://example.test/204"
+        client = FakeClient({
+            ("🇺🇸 current", base_url): 120,
+            ("🇺🇸 current", OPENAI_TARGET_URL): 502,
+            ("🇺🇸 better", base_url): 80,
+            ("🇺🇸 better", OPENAI_TARGET_URL): None,
+        })
+
+        result = run_check(
+            client=client,
+            base_url=base_url,
+            timeout_ms=1000,
+            targets={OPENAI_TARGET_NAME: OPENAI_TARGET_URL},
+            target_timeout_ms=1000,
+            state_file=None,
+        )
+
+        self.assertEqual(OPENAI_TARGET_URL, result["targets"][OPENAI_TARGET_NAME])
+        self.assertEqual(2, result["region_nodes_count"])
+        self.assertEqual("slow", result["nodes"][0]["targets"][OPENAI_TARGET_NAME]["level"])
+        self.assertEqual("dead", result["nodes"][1]["targets"][OPENAI_TARGET_NAME]["level"])
+        self.assertEqual(1, len(result["target_alive"][OPENAI_TARGET_NAME]))
+        self.assertEqual(1, len(result["target_dead"][OPENAI_TARGET_NAME]))
+
     def test_run_check_rejects_invalid_region_before_requesting_proxies(self):
         client = FakeClient({"🇺🇸 current": 120})
 
@@ -194,6 +248,42 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual({"error": "--region: invalid value 'ca'"}, json.loads(buffer.getvalue()))
         client_class.assert_not_called()
+
+    def test_cli_accepts_openai_target_alias(self):
+        base_url = "http://example.test/204"
+        client = FakeClient(
+            {
+                ("日本 current", base_url): 120,
+                ("日本 current", OPENAI_TARGET_URL): 502,
+            },
+            nodes=["日本 current"],
+            now="日本 current",
+        )
+        buffer = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "check_us_proxy_status.py",
+                "--region",
+                "jp",
+                "--url",
+                base_url,
+                "--no-default-targets",
+                "--target",
+                "openai",
+                "--json",
+            ],
+        ):
+            with patch("check_us_proxy_status.MihomoUnixClient", return_value=client):
+                with redirect_stdout(buffer):
+                    code = main()
+
+        result = json.loads(buffer.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual("jp", result["region"])
+        self.assertEqual({OPENAI_TARGET_NAME: OPENAI_TARGET_URL}, result["targets"])
+        self.assertEqual("slow", result["nodes"][0]["targets"][OPENAI_TARGET_NAME]["level"])
 
     def test_default_policy_fields_match_requirements(self):
         client = FakeClient({"🇺🇸 current": 120, "🇺🇸 better": 80})
@@ -519,6 +609,64 @@ class AutoSwitchPolicyTest(unittest.TestCase):
             self.assertEqual("discord", confirmation["target"])
             self.assertEqual(850, confirmation["check"]["delay_ms"])
             self.assertEqual("candidate_confirmation_not_improved", confirmation["reason"])
+
+    def test_auto_switch_can_use_openai_as_switch_check_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            targets = {OPENAI_TARGET_NAME: OPENAI_TARGET_URL}
+            base_url = "http://example.test/204"
+            client = FakeClient({
+                ("🇺🇸 current", base_url): 100,
+                ("🇺🇸 current", OPENAI_TARGET_URL): 900,
+                ("🇺🇸 better", base_url): 120,
+                ("🇺🇸 better", OPENAI_TARGET_URL): 220,
+            })
+
+            result = run_fake(
+                client,
+                state_file,
+                targets=targets,
+                switch_check_target=OPENAI_TARGET_NAME,
+                bad_confirm_count=1,
+            )
+
+            self.assertEqual(OPENAI_TARGET_NAME, result["auto_switch"]["check_target"])
+            self.assertEqual(OPENAI_TARGET_NAME, result["auto_switch"]["candidate_quality_target"])
+            self.assertEqual(f"target:{OPENAI_TARGET_NAME}", result["current_node"]["switch_by"])
+            self.assertEqual("poor", result["current_node"]["switch_level"])
+            self.assertEqual(1, result["auto_switch"]["candidate_filter"]["eligible"])
+            self.assertEqual("success", result["auto_switch"]["status"])
+            self.assertEqual("🇺🇸 better", result["auto_switch"]["to_node"])
+
+    def test_candidate_confirmation_can_use_openai_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            targets = {OPENAI_TARGET_NAME: OPENAI_TARGET_URL}
+            base_url = "http://example.test/204"
+            client = FakeClient({
+                ("🇺🇸 current", base_url): 100,
+                ("🇺🇸 current", OPENAI_TARGET_URL): 900,
+                ("🇺🇸 better", base_url): 120,
+                ("🇺🇸 better", OPENAI_TARGET_URL): [220, 230],
+            })
+
+            result = run_fake(
+                client,
+                state_file,
+                targets=targets,
+                switch_check_target=OPENAI_TARGET_NAME,
+                bad_confirm_count=1,
+                confirm_candidate=True,
+                confirm_target=OPENAI_TARGET_NAME,
+            )
+
+            self.assertEqual(OPENAI_TARGET_NAME, result["switch_policy"]["confirm_target"])
+            confirmation = result["auto_switch"]["candidate_confirmation"]
+            self.assertTrue(confirmation["enabled"])
+            self.assertEqual(OPENAI_TARGET_NAME, confirmation["target"])
+            self.assertEqual(230, confirmation["check"]["delay_ms"])
+            self.assertTrue(confirmation["passed"])
+            self.assertEqual("success", result["auto_switch"]["status"])
 
     def test_empty_confirm_target_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:

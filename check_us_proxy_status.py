@@ -38,7 +38,11 @@ REGION_KEYWORDS = MappingProxyType({
 })
 DEFAULT_SOCKET = "/tmp/verge/verge-mihomo.sock"
 DEFAULT_BASE_URL = "http://www.gstatic.com/generate_204"
-DEFAULT_TARGETS = {"discord": "https://discord.com/api/v10/gateway"}
+DEFAULT_DISCORD_TARGET_URL = "https://discord.com/api/v10/gateway"
+OPENAI_TARGET_NAME = "openai"
+OPENAI_TARGET_URL = "https://api.openai.com/v1/models"
+DEFAULT_TARGETS = {"discord": DEFAULT_DISCORD_TARGET_URL}
+TARGET_ALIASES = MappingProxyType({OPENAI_TARGET_NAME: OPENAI_TARGET_URL})
 DEFAULT_PREFER_GROUPS = ["🤖 OpenAi", "🤖AI网站", "🔰 代理", "🚀节点选择", "GLOBAL"]
 GOOD_DELAY_MS = 300
 SLOW_DELAY_MS = 800
@@ -208,7 +212,11 @@ def validate_url(url: str) -> None:
 
 def parse_target(raw: str) -> tuple[str, str]:
     if "=" not in raw:
-        raise ValueError(f"--target must use name=URL format: {raw}")
+        name = raw.strip().lower()
+        if name in TARGET_ALIASES:
+            return name, TARGET_ALIASES[name]
+        aliases = ", ".join(TARGET_ALIASES)
+        raise ValueError(f"--target must use name=URL format or known alias ({aliases}): {raw}")
     name, url = raw.split("=", 1)
     name = name.strip()
     url = url.strip()
@@ -1340,7 +1348,11 @@ def main() -> int:
     )
     parser.add_argument("--url", default=DEFAULT_BASE_URL, help=f"base delay-test URL; default: {DEFAULT_BASE_URL}")
     parser.add_argument("--timeout", type=int, default=5000, help="base delay-test timeout in ms; default: 5000")
-    parser.add_argument("--target", action="append", help="target API to test, format name=URL; repeatable")
+    parser.add_argument(
+        "--target",
+        action="append",
+        help=f"target API to test, format name=URL or alias such as {OPENAI_TARGET_NAME}; repeatable",
+    )
     parser.add_argument("--target-timeout", type=int, default=8000, help="target API timeout in ms; default: 8000")
     parser.add_argument("--no-default-targets", action="store_true", help="do not include built-in default target APIs")
     parser.add_argument(
@@ -1348,7 +1360,7 @@ def main() -> int:
         action="store_true",
         help="current-first mode: scan and switch only after policy confirmation and cooldown checks allow it",
     )
-    parser.add_argument("--switch-check-target", help="target name used to decide current quality and choose best node, e.g. discord")
+    parser.add_argument("--switch-check-target", help="target name used to decide current quality and choose best node, e.g. discord or openai")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"auto-switch state file; default: {DEFAULT_STATE_FILE}")
     parser.add_argument("--bad-threshold", default=DEFAULT_BAD_THRESHOLD, choices=["poor"], help=f"level treated as bad for confirmation; default: {DEFAULT_BAD_THRESHOLD}")
     parser.add_argument("--bad-confirm-count", type=int, default=DEFAULT_BAD_CONFIRM_COUNT, help=f"consecutive poor/dead/unknown checks before scanning candidates; default: {DEFAULT_BAD_CONFIRM_COUNT}")

@@ -73,6 +73,16 @@ docs/check_us_proxy_status_requirements.md
   --target discord_cdn=https://cdn.discordapp.com
 ```
 
+按需检测 OpenAI API：
+
+```bash
+./check_us_proxy_status.py \
+  --target openai \
+  --json
+```
+
+OpenAI 目标不会默认加载；需要用于切换判断或候选复测时，必须显式传入 `--target openai`，等价于 `--target openai=https://api.openai.com/v1/models`。
+
 ## 自动切换
 
 自动切换默认关闭。启用后，脚本先只检测当前正在使用的指定地区节点；只有策略确认需要切换时，才扫描同地区候选节点。
@@ -194,7 +204,8 @@ JSON 中 `base` 和每个 `targets` 检测结果都会包含 `level`：
 --region                       检测地区，支持 us/sg/uk/jp/hk/de/fr，默认 us
 --url                          基础测速 URL
 --timeout                      基础单节点测速超时时间，单位 ms
---target                       目标 API，格式 name=URL，可重复传入
+--target                       目标 API，格式 name=URL 或内置别名，可重复传入
+                               OpenAI 示例：openai
 --target-timeout               目标 API 单节点检测超时时间，单位 ms
 --no-default-targets           不加载默认目标 API
 --auto-switch-if-current-not-good
@@ -250,11 +261,25 @@ python3 -m py_compile check_us_proxy_status.py
   --json
 ```
 
+```bash
+./check_us_proxy_status.py \
+  --target openai \
+  --json
+```
+
 自动切换验证：
 
 ```bash
 ./check_us_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord \
+  --json
+```
+
+```bash
+./check_us_proxy_status.py \
+  --auto-switch-if-current-not-good \
+  --switch-check-target openai \
+  --target openai \
   --json
 ```
