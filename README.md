@@ -1,6 +1,6 @@
 # auto-check-node
 
-用于检查 Clash Verge Rev / mihomo 中美国代理节点的实时状态、目标 API 可达性，并可在当前节点达到策略确认条件时尝试切换到更优节点。
+用于检查 Clash Verge Rev / mihomo 中指定地区代理节点的实时状态、目标 API 可达性，并可在当前节点达到策略确认条件时尝试切换到更优节点。默认地区为美国，保持旧版使用方式兼容。
 
 脚本文件：
 
@@ -18,8 +18,8 @@ docs/check_us_proxy_status_requirements.md
 
 - 通过 mihomo Unix Socket 调用控制 API。
 - 从 `/proxies` 全量代理池读取代理对象。
-- 本地按节点名称过滤美国真实节点。
-- 对每个美国节点执行基础延迟检测。
+- 本地按节点名称过滤指定地区真实节点，默认美国。
+- 对每个地区节点执行基础延迟检测。
 - 对一个或多个目标 API 执行可达性检测。
 - 默认只检测状态，不主动切换任何策略组。
 - 可显式启用自动切换：当前节点达到连续确认条件且未被冷却阻止时，扫描候选并尝试切到更优可用节点。
@@ -51,6 +51,14 @@ docs/check_us_proxy_status_requirements.md
 ./check_us_proxy_status.py --json
 ```
 
+指定检测地区：
+
+```bash
+./check_us_proxy_status.py --region sg --json
+```
+
+`--region` 支持 `us`、`sg`、`uk`、`jp`、`hk`、`de`、`fr`，大小写不敏感。默认 `us` 继续使用旧版美国关键词语义：`🇺🇸`、`美国`、`US`、`USA`、`United States`。
+
 只检测基础状态，不加载默认 Discord 目标：
 
 ```bash
@@ -67,10 +75,11 @@ docs/check_us_proxy_status_requirements.md
 
 ## 自动切换
 
-自动切换默认关闭。启用后，脚本先只检测当前正在使用的美国节点；只有策略确认需要切换时，才扫描候选节点。
+自动切换默认关闭。启用后，脚本先只检测当前正在使用的指定地区节点；只有策略确认需要切换时，才扫描同地区候选节点。
 
 ```bash
 ./check_us_proxy_status.py \
+  --region sg \
   --auto-switch-if-current-not-good \
   --switch-check-target discord
 ```
@@ -182,6 +191,7 @@ JSON 中 `base` 和每个 `targets` 检测结果都会包含 `level`：
 
 ```text
 --socket                       mihomo Unix Socket 路径
+--region                       检测地区，支持 us/sg/uk/jp/hk/de/fr，默认 us
 --url                          基础测速 URL
 --timeout                      基础单节点测速超时时间，单位 ms
 --target                       目标 API，格式 name=URL，可重复传入
@@ -227,6 +237,10 @@ python3 -m py_compile check_us_proxy_status.py
 
 ```bash
 ./check_us_proxy_status.py --json
+```
+
+```bash
+./check_us_proxy_status.py --region sg --json
 ```
 
 ```bash

@@ -102,6 +102,32 @@ COMPATIBLE
 
 最终只对真实代理节点测速。
 
+## 地区选择规则
+
+脚本应支持通过 `--region` 选择检测地区，默认值为 `us`，大小写不敏感。默认 `us` 必须保持上述美国节点过滤语义兼容。
+
+当前内置地区值：
+
+```text
+us
+sg
+uk
+jp
+hk
+de
+fr
+```
+
+传入非内置地区时，脚本必须在执行任何检测前退出，退出码为 `1`。人类可读输出的错误信息必须精确为：
+
+```text
+--region: invalid value '{value}'
+```
+
+JSON 输出可使用结构化错误字段，但错误值必须为同一字符串。
+
+启用非 `us` 地区后，本文中“美国节点”的检测范围、当前节点识别和自动切换候选范围均按指定地区解释；策略组与特殊节点排除规则保持不变。
+
 ## 基础实时状态获取方式
 
 对每个过滤出的美国节点单独调用：
@@ -505,6 +531,7 @@ JSON 输出中应体现检测范围：
 ```json
 {
   "source": "/proxies full pool",
+  "region": "us",
   "filter": "name contains 🇺🇸 / 美国 / US / USA / United States; excludes strategy groups and special nodes",
   "base_url": "http://www.gstatic.com/generate_204",
   "targets": {
@@ -513,7 +540,7 @@ JSON 输出中应体现检测范围：
   "timeout_ms": 5000,
   "target_timeout_ms": 8000,
   "strategy_groups_protected": 10,
-  "us_nodes_count": 32,
+  "region_nodes_count": 32,
   "nodes": [
     {
       "name": "节点名",
@@ -640,6 +667,9 @@ JSON 输出中应体现检测范围：
 
 - `base_alive` / `base_dead` 替代旧版 `alive` / `dead`。
 - 为便于迁移，可以保留旧版 `alive` / `dead` 字段作为 `base_alive` / `base_dead` 的别名。
+- `region` 表示实际规范化后的地区值，例如 `us`、`sg`。
+- `region_nodes_count` 表示当前 `--region` 过滤出的真实节点数量，替代旧版 `us_nodes_count` 口径。
+- `filter` 应按地区关键词动态生成。
 - 当自动切换成功时，`guarantee` 可以为 `changed_as_requested`。
 - 当默认检测模式或未触发自动切换时，`guarantee` 应为 `unchanged`。
 
@@ -649,6 +679,7 @@ JSON 输出中应体现检测范围：
 
 ```text
 --socket                       mihomo Unix Socket 路径，默认 /tmp/verge/verge-mihomo.sock
+--region                       检测地区，支持 us/sg/uk/jp/hk/de/fr，大小写不敏感，默认 us
 --url                          基础测速 URL，默认 http://www.gstatic.com/generate_204
 --timeout                      基础单节点测速超时时间，单位 ms，默认 5000
 --target                       目标 API，格式 名称=URL，可重复传入
@@ -695,6 +726,24 @@ check_us_proxy_status.py
 ./check_us_proxy_status.py --json
 ```
 
+指定地区验证：
+
+```bash
+./check_us_proxy_status.py --region sg --json
+```
+
+无效地区验证：
+
+```bash
+./check_us_proxy_status.py --region ca
+```
+
+应在不请求 `/proxies` 的情况下返回退出码 `1`，并输出：
+
+```text
+--region: invalid value 'ca'
+```
+
 以及：
 
 ```bash
@@ -716,10 +765,11 @@ check_us_proxy_status.py
 验证通过标准：
 
 ```text
-us_nodes_count > 0
+region 为规范化后的地区值
+region_nodes_count > 0
 nodes 中包含 base 与 targets 字段
-base_alive + base_dead 数量等于 us_nodes_count
-target_alive.discord + target_dead.discord 数量等于 us_nodes_count
+base_alive + base_dead 数量等于 region_nodes_count
+target_alive.discord + target_dead.discord 数量等于 region_nodes_count
 current_node 字段存在且能说明是否识别成功
 未启用自动切换时 guarantee = unchanged
 启用自动切换但当前节点等级为 good 时 auto_switch.triggered=false、auto_switch.candidate_scan_started=false 且 guarantee=unchanged
@@ -735,7 +785,7 @@ still_changed 为空，或只包含允许的自动切换变化
 最重要的约束是：
 
 ```text
-只用 /proxies 获取完整代理池并过滤美国节点；
+只用 /proxies 获取完整代理池并过滤指定地区真实节点，默认地区 us 保持美国节点兼容语义；
 只对真实节点逐个调用 /proxies/{node}/delay；
 目标 API 检测也必须使用 /proxies/{node}/delay?url={目标 API}；
 绝不调用 /group/{group}/delay；
@@ -744,6 +794,6 @@ still_changed 为空，或只包含允许的自动切换变化
 自动切换模式默认只检测当前正在使用的节点；
 只有当前节点达到策略确认条件且未被冷却阻止时才检测其它候选节点并允许切换；
 当前节点等级为 good 时不得因为更快节点存在而检测候选或切换；
-自动切换只能切到目标策略组 all 列表中的最优可用美国节点；
+自动切换只能切到目标策略组 all 列表中的最优可用指定地区节点；
 最终确认策略组状态符合预期。
 ```

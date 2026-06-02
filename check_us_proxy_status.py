@@ -22,10 +22,20 @@ import socket
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol
 
 GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance", "Relay"}
 SPECIAL_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"}
+REGION_KEYWORDS = MappingProxyType({
+    "us": ("🇺🇸", "美国", "US", "USA", "United States"),
+    "sg": ("新加坡", "SG", "Singapore"),
+    "uk": ("英国", "UK", "United Kingdom", "England"),
+    "jp": ("日本", "JP", "Japan"),
+    "hk": ("香港", "HK", "Hong Kong"),
+    "de": ("德国", "DE", "Germany"),
+    "fr": ("法国", "FR", "France"),
+})
 DEFAULT_SOCKET = "/tmp/verge/verge-mihomo.sock"
 DEFAULT_BASE_URL = "http://www.gstatic.com/generate_204"
 DEFAULT_TARGETS = {"discord": "https://discord.com/api/v10/gateway"}
@@ -164,16 +174,30 @@ def snapshot_strategy_groups(proxies: dict[str, dict[str, Any]]) -> dict[str, st
     }
 
 
-def is_us_real_node(name: str, proxy: dict[str, Any]) -> bool:
+def normalize_region(value: str | None) -> str:
+    region = "us" if value is None else value.lower()
+    if region not in REGION_KEYWORDS:
+        raise ValueError(f"--region: invalid value '{value}'")
+    return region
+
+
+def _keyword_matches(name: str, keyword: str) -> bool:
+    if keyword.isascii() and keyword.isalpha() and len(keyword) <= 3:
+        return bool(re.search(rf"\b{re.escape(keyword)}\b", name, re.IGNORECASE))
+    return bool(re.search(re.escape(keyword), name, re.IGNORECASE))
+
+
+def is_region_real_node(name: str, proxy: dict[str, Any], region: str = "us") -> bool:
+    region = normalize_region(region)
     if name in SPECIAL_NAMES:
         return False
     if proxy.get("type") in GROUP_TYPES:
         return False
-    return bool(
-        "🇺🇸" in name
-        or "美国" in name
-        or re.search(r"\bUS\b|\bUSA\b|United States", name, re.IGNORECASE)
-    )
+    return any(_keyword_matches(name, keyword) for keyword in REGION_KEYWORDS[region])
+
+
+def is_us_real_node(name: str, proxy: dict[str, Any]) -> bool:
+    return is_region_real_node(name, proxy, "us")
 
 
 def validate_url(url: str) -> None:
@@ -286,10 +310,18 @@ def check_node(
     return NodeResult(name=node, base=base, targets=target_results)
 
 
-def resolve_group_to_us_node(
+def region_filter_description(region: str) -> str:
+    region = normalize_region(region)
+    return (
+        f"name contains {' / '.join(REGION_KEYWORDS[region])}; "
+        "excludes strategy groups and special nodes"
+    )
+
+
+def resolve_group_to_region_node(
     group_name: str,
     proxies: dict[str, dict[str, Any]],
-    us_nodes: set[str],
+    region_nodes: set[str],
     max_depth: int = 5,
 ) -> str | None:
     seen: set[str] = set()
@@ -301,7 +333,7 @@ def resolve_group_to_us_node(
         now = proxies.get(current, {}).get("now")
         if not isinstance(now, str) or not now:
             return None
-        if now in us_nodes:
+        if now in region_nodes:
             return now
         if proxies.get(now, {}).get("type") in GROUP_TYPES:
             current = now
@@ -310,22 +342,56 @@ def resolve_group_to_us_node(
     return None
 
 
+def resolve_group_current_node(
+    group_name: str,
+    proxies: dict[str, dict[str, Any]],
+    max_depth: int = 5,
+) -> tuple[str | None, str | None]:
+    seen: set[str] = set()
+    current = group_name
+    via = "direct"
+    for _ in range(max_depth):
+        if current in seen:
+            return None, None
+        seen.add(current)
+        now = proxies.get(current, {}).get("now")
+        if not isinstance(now, str) or not now:
+            return None, None
+        if proxies.get(now, {}).get("type") in GROUP_TYPES:
+            current = now
+            via = "resolved"
+            continue
+        return now, via
+    return None, None
+
+
 def detect_current_node(
     proxies: dict[str, dict[str, Any]],
     original_groups: dict[str, str],
-    us_nodes: list[str],
+    region_nodes: list[str],
     prefer_groups: list[str] | None,
+    region: str,
 ) -> dict[str, Any]:
-    us_set = set(us_nodes)
+    region = normalize_region(region)
+    region_set = set(region_nodes)
     direct: list[tuple[str, str]] = []
     resolved: list[tuple[str, str]] = []
+    mismatched: list[tuple[str, str, str]] = []
     for group, now in original_groups.items():
-        if now in us_set:
+        if now in region_set:
             direct.append((group, now))
         elif proxies.get(now, {}).get("type") in GROUP_TYPES:
-            node = resolve_group_to_us_node(group, proxies, us_set)
+            node = resolve_group_to_region_node(group, proxies, region_set)
             if node:
                 resolved.append((group, node))
+            else:
+                raw_node, via = resolve_group_current_node(group, proxies)
+                if raw_node:
+                    mismatched.append((group, raw_node, via or "resolved"))
+        else:
+            raw_node, via = resolve_group_current_node(group, proxies)
+            if raw_node:
+                mismatched.append((group, raw_node, via or "direct"))
 
     candidates = direct + resolved
     prefer_groups = prefer_groups or DEFAULT_PREFER_GROUPS
@@ -336,7 +402,46 @@ def detect_current_node(
     if candidates:
         group, node = candidates[0]
         return {"detected": True, "group": group, "name": node, "via": "direct" if (group, node) in direct else "resolved"}
-    return {"detected": False, "group": None, "name": None, "via": None, "reason": "no_strategy_group_points_to_us_node"}
+    for preferred in prefer_groups:
+        for group, node, via in mismatched:
+            if group == preferred:
+                return {
+                    "detected": False,
+                    "group": group,
+                    "name": node,
+                    "via": via,
+                    "reason": "current_node_region_mismatch",
+                    "current_raw_node": node,
+                    "expected_region": region,
+                }
+    if mismatched:
+        group, node, via = mismatched[0]
+        return {
+            "detected": False,
+            "group": group,
+            "name": node,
+            "via": via,
+            "reason": "current_node_region_mismatch",
+            "current_raw_node": node,
+            "expected_region": region,
+        }
+    return {
+        "detected": False,
+        "group": None,
+        "name": None,
+        "via": None,
+        "reason": "no_strategy_group_points_to_region_node",
+        "expected_region": region,
+    }
+
+
+def resolve_group_to_us_node(
+    group_name: str,
+    proxies: dict[str, dict[str, Any]],
+    us_nodes: set[str],
+    max_depth: int = 5,
+) -> str | None:
+    return resolve_group_to_region_node(group_name, proxies, us_nodes, max_depth)
 
 
 def current_switch_check(result: NodeResult, switch_check_target: str | None) -> tuple[CheckResult | None, str]:
@@ -751,12 +856,14 @@ def run_check(
     avoid_recent_switches: int = DEFAULT_AVOID_RECENT_SWITCHES,
     avoid_recent_window_seconds: int = DEFAULT_AVOID_RECENT_WINDOW_SECONDS,
     now: float | None = None,
+    region: str = "us",
 ) -> dict[str, Any]:
     now = time.time() if now is None else now
+    region = normalize_region(region)
     bad_threshold = normalize_bad_threshold(bad_threshold)
     proxies = client.get_json("/proxies")["proxies"]
     original_groups = snapshot_strategy_groups(proxies)
-    us_nodes = [name for name, proxy in proxies.items() if is_us_real_node(name, proxy)]
+    region_nodes = [name for name, proxy in proxies.items() if is_region_real_node(name, proxy, region)]
     restore_events: list[dict[str, str]] = []
     allowed_changes: dict[str, str] = {}
     node_results: list[NodeResult] = []
@@ -807,7 +914,7 @@ def run_check(
     if auto_switch_if_current_not_good:
         switch_state, state_load_error = load_switch_state(state_file)
         switch_policy["state_load_error"] = state_load_error
-        current_node_info = detect_current_node(proxies, original_groups, us_nodes, prefer_groups)
+        current_node_info = detect_current_node(proxies, original_groups, region_nodes, prefer_groups, region)
         if not current_node_info.get("detected"):
             policy, decision, next_state = decide_switch_policy(
                 switch_state,
@@ -827,6 +934,11 @@ def run_check(
             )
             switch_policy.update(policy)
             switch_decision.update(decision)
+            if current_node_info.get("reason") == "current_node_region_mismatch":
+                switch_decision.update({
+                    "should_scan_candidates": False,
+                    "reason": "current_node_region_mismatch",
+                })
             state_save_error = save_switch_state(state_file, next_state)
             if state_save_error:
                 switch_policy["state_save_error"] = state_save_error
@@ -901,7 +1013,7 @@ def run_check(
                 allowed_for_switch_group = set(proxies.get(current_group, {}).get("all") or [])
                 candidate_nodes = [
                     node
-                    for node in us_nodes
+                    for node in region_nodes
                     if node != current_name and node in allowed_for_switch_group
                 ]
                 for node in candidate_nodes:
@@ -1032,7 +1144,7 @@ def run_check(
                             })
                         append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups, allowed_changes))
     else:
-        for node in us_nodes:
+        for node in region_nodes:
             node_results.append(
                 check_node(client, node, base_url, timeout_ms, targets, target_timeout_ms, original_groups, restore_events)
             )
@@ -1054,14 +1166,15 @@ def run_check(
 
     return {
         "source": "/proxies full pool",
-        "filter": "name contains 🇺🇸 / 美国 / US / USA / United States; excludes strategy groups and special nodes",
+        "region": region,
+        "filter": region_filter_description(region),
         "base_url": base_url,
         "test_url": base_url,
         "targets": targets,
         "timeout_ms": timeout_ms,
         "target_timeout_ms": target_timeout_ms,
         "strategy_groups_protected": len(original_groups),
-        "us_nodes_count": len(us_nodes),
+        "region_nodes_count": len(region_nodes),
         "nodes": [node_json(r) for r in node_results],
         "base_alive": [{"name": r.name, "delay_ms": r.base.delay, "level": r.base.level} for r in base_alive],
         "base_dead": [{"name": r.name, "level": r.base.level, "error": r.base.error} for r in base_dead],
@@ -1116,7 +1229,8 @@ def _print_candidate_filter(stats: dict[str, Any] | None) -> None:
 def print_human(result: dict[str, Any]) -> None:
     targets: dict[str, str] = result["targets"]
     print("过滤来源: /proxies 全量代理池")
-    print("过滤规则: 名称包含 🇺🇸 / 美国 / US / USA / United States；排除策略组与 DIRECT/REJECT")
+    print(f"地区: {result.get('region', 'us')}")
+    print(f"过滤规则: {result['filter']}")
     print(f"基础测试 URL: {result['base_url']}")
     print(f"基础超时: {result['timeout_ms']}ms")
     print(f"目标 API 超时: {result['target_timeout_ms']}ms")
@@ -1127,7 +1241,7 @@ def print_human(result: dict[str, Any]) -> None:
     else:
         print("- 无")
     print(f"捕获需保护的策略组数量: {result['strategy_groups_protected']}")
-    print(f"美国节点数量: {result['us_nodes_count']}")
+    print(f"地区节点数量: {result['region_nodes_count']}")
     print(f"自动切换模式: {'开启' if result['auto_switch']['enabled'] else '关闭'}")
     if result["auto_switch"]["enabled"]:
         cn = result["current_node"]
@@ -1139,6 +1253,10 @@ def print_human(result: dict[str, Any]) -> None:
             print(f"当前节点: {cn.get('name')}")
             print(f"当前节点基础状态: {'dead' if cn.get('dead') else 'alive'} ({cn.get('dead_by')})")
             print(f"当前节点需要切换: {cn.get('needs_switch')} ({cn.get('switch_by')}={cn.get('switch_level')})")
+        elif cn.get("reason") == "current_node_region_mismatch":
+            print(f"当前策略组: {cn.get('group')}")
+            print(f"当前原始节点: {cn.get('current_raw_node') or cn.get('name')}")
+            print(f"期望地区: {cn.get('expected_region')}")
         print(f"切换判断目标: {result['auto_switch'].get('candidate_quality_target')}")
         print(f"决策原因: {decision.get('reason')}")
         print(f"计数器 bad: {_format_counter(policy.get('bad_count', 0), policy.get('bad_confirm_count', 0))}")
@@ -1165,7 +1283,7 @@ def print_human(result: dict[str, Any]) -> None:
             print(f"切换目标: {result['auto_switch']['to_node']}")
     print()
 
-    print("美国节点实时状态，按基础延迟排序:")
+    print("地区节点实时状态，按基础延迟排序:")
     ordered_nodes = sorted(
         result["nodes"],
         key=lambda r: (not r["base"]["ok"], r["base"]["delay_ms"] if r["base"]["delay_ms"] is not None else 10**9),
@@ -1212,9 +1330,14 @@ def print_human(result: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Realtime US proxy status and target API checker without using group membership or accidental switching."
+        description="Realtime regional proxy status and target API checker without using group membership or accidental switching."
     )
     parser.add_argument("--socket", default=DEFAULT_SOCKET, help=f"mihomo unix socket path; default: {DEFAULT_SOCKET}")
+    parser.add_argument(
+        "--region",
+        default="us",
+        help="region to filter by: us, sg, uk, jp, hk, de, fr; case-insensitive; default: us",
+    )
     parser.add_argument("--url", default=DEFAULT_BASE_URL, help=f"base delay-test URL; default: {DEFAULT_BASE_URL}")
     parser.add_argument("--timeout", type=int, default=5000, help="base delay-test timeout in ms; default: 5000")
     parser.add_argument("--target", action="append", help="target API to test, format name=URL; repeatable")
@@ -1243,6 +1366,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        region = normalize_region(args.region)
         validate_url(args.url)
         targets = build_targets(args)
         if args.switch_check_target and args.switch_check_target not in targets:
@@ -1272,12 +1396,16 @@ def main() -> int:
             confirm_target=args.confirm_target,
             avoid_recent_switches=args.avoid_recent_switches,
             avoid_recent_window_seconds=args.avoid_recent_window_seconds,
+            region=region,
         )
     except Exception as exc:
+        message = str(exc)
         if args.json:
-            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2))
+            print(json.dumps({"error": message}, ensure_ascii=False, indent=2))
+        elif message.startswith("--region: invalid value "):
+            print(message)
         else:
-            print(f"执行失败: {exc}")
+            print(f"执行失败: {message}")
         return 1
 
     if args.json:

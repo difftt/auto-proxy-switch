@@ -1,18 +1,30 @@
 import json
 import io
+import sys
 import tempfile
 import unittest
 import urllib.parse
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
-from check_us_proxy_status import CheckResult, decide_switch_policy, print_human, run_check
+from check_us_proxy_status import (
+    CheckResult,
+    REGION_KEYWORDS,
+    decide_switch_policy,
+    is_region_real_node,
+    is_us_real_node,
+    main,
+    normalize_region,
+    print_human,
+    run_check,
+)
 
 
 class FakeClient:
-    def __init__(self, delays, nodes=None):
+    def __init__(self, delays, nodes=None, now="🇺🇸 current"):
         self.delays = delays
-        self.now = "🇺🇸 current"
+        self.now = now
         self.requests = []
         self.puts = []
         self.nodes = nodes or ["🇺🇸 current", "🇺🇸 better"]
@@ -81,6 +93,108 @@ def run_fake(client, state_file, **kwargs):
 
 
 class AutoSwitchPolicyTest(unittest.TestCase):
+    def test_region_keywords_cover_supported_regions(self):
+        self.assertEqual({"us", "sg", "uk", "jp", "hk", "de", "fr"}, set(REGION_KEYWORDS))
+        self.assertEqual(("🇺🇸", "美国", "US", "USA", "United States"), REGION_KEYWORDS["us"])
+        with self.assertRaises(TypeError):
+            REGION_KEYWORDS["ca"] = ("加拿大",)
+
+    def test_normalize_region_is_case_insensitive_and_rejects_invalid_value(self):
+        self.assertEqual("us", normalize_region(None))
+        self.assertEqual("us", normalize_region("US"))
+        self.assertEqual("sg", normalize_region("Sg"))
+        with self.assertRaisesRegex(ValueError, "--region: invalid value 'ca'"):
+            normalize_region("ca")
+
+    def test_us_real_node_keeps_legacy_keywords_and_boundaries(self):
+        proxy = {"type": "Shadowsocks"}
+
+        for name in ["🇺🇸 fast", "美国 fast", "US fast", "usa fast", "United States fast"]:
+            self.assertTrue(is_us_real_node(name, proxy), name)
+            self.assertTrue(is_region_real_node(name, proxy, "US"), name)
+
+        for name in ["BUS node", "USAble node", "united kingdom"]:
+            self.assertFalse(is_us_real_node(name, proxy), name)
+
+    def test_region_real_node_filters_groups_special_names_and_other_regions(self):
+        self.assertTrue(is_region_real_node("新加坡 01", {"type": "Shadowsocks"}, "sg"))
+        self.assertTrue(is_region_real_node("Singapore 01", {"type": "Shadowsocks"}, "SG"))
+        self.assertFalse(is_region_real_node("🇺🇸 01", {"type": "Shadowsocks"}, "sg"))
+        self.assertFalse(is_region_real_node("新加坡 group", {"type": "Selector"}, "sg"))
+        self.assertFalse(is_region_real_node("DIRECT", {"type": "Shadowsocks"}, "sg"))
+
+    def test_run_check_uses_requested_region_for_real_node_filtering(self):
+        client = FakeClient(
+            {"🇺🇸 current": 120, "新加坡 better": 80, "Singapore backup": 90},
+            nodes=["🇺🇸 current", "新加坡 better", "Singapore backup"],
+        )
+
+        result = run_check(
+            client=client,
+            base_url="http://example.test/204",
+            timeout_ms=1000,
+            targets={},
+            target_timeout_ms=1000,
+            state_file=None,
+            region="SG",
+        )
+
+        self.assertEqual(["新加坡 better", "Singapore backup"], client.requested_nodes())
+        self.assertEqual("sg", result["region"])
+        self.assertEqual(
+            "name contains 新加坡 / SG / Singapore; excludes strategy groups and special nodes",
+            result["filter"],
+        )
+        self.assertEqual(2, result["region_nodes_count"])
+
+    def test_run_check_rejects_invalid_region_before_requesting_proxies(self):
+        client = FakeClient({"🇺🇸 current": 120})
+
+        with self.assertRaisesRegex(ValueError, "--region: invalid value 'ca'"):
+            run_check(
+                client=client,
+                base_url="http://example.test/204",
+                timeout_ms=1000,
+                targets={},
+                target_timeout_ms=1000,
+                state_file=None,
+                region="ca",
+            )
+
+        self.assertEqual([], client.requests)
+
+    def test_cli_help_includes_region_option(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--help"]):
+            with redirect_stdout(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+
+        self.assertEqual(0, raised.exception.code)
+        self.assertIn("--region", buffer.getvalue())
+
+    def test_cli_invalid_region_exits_1_without_requesting_proxies(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--region", "ca"]):
+            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
+                with redirect_stdout(buffer):
+                    code = main()
+
+        self.assertEqual(1, code)
+        self.assertEqual("--region: invalid value 'ca'\n", buffer.getvalue())
+        client_class.assert_not_called()
+
+    def test_cli_invalid_region_json_keeps_structured_error_without_requesting_proxies(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--region", "ca", "--json"]):
+            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
+                with redirect_stdout(buffer):
+                    code = main()
+
+        self.assertEqual(1, code)
+        self.assertEqual({"error": "--region: invalid value 'ca'"}, json.loads(buffer.getvalue()))
+        client_class.assert_not_called()
+
     def test_default_policy_fields_match_requirements(self):
         client = FakeClient({"🇺🇸 current": 120, "🇺🇸 better": 80})
 
@@ -101,6 +215,44 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         self.assertEqual(600, result["switch_policy"]["slow_switch_threshold_ms"])
         self.assertEqual(5, result["switch_policy"]["slow_confirm_count"])
         self.assertEqual(600, result["switch_policy"]["switch_cooldown_seconds"])
+
+    def test_auto_switch_skips_when_current_node_is_not_requested_region(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            client = FakeClient(
+                {"🇺🇸 current": 900, "新加坡 better": 100},
+                nodes=["🇺🇸 current", "新加坡 better"],
+                now="🇺🇸 current",
+            )
+
+            result = run_fake(client, state_file, region="sg", bad_confirm_count=1)
+
+            self.assertEqual([], client.requested_nodes())
+            self.assertEqual([], client.puts)
+            self.assertEqual("current_node_region_mismatch", result["current_node"]["reason"])
+            self.assertEqual("🇺🇸 current", result["current_node"]["current_raw_node"])
+            self.assertEqual("sg", result["current_node"]["expected_region"])
+            self.assertEqual("current_node_region_mismatch", result["switch_decision"]["reason"])
+            self.assertFalse(result["switch_decision"]["should_scan_candidates"])
+            self.assertFalse(result["auto_switch"]["candidate_scan_started"])
+            self.assertEqual("skipped", result["auto_switch"]["status"])
+            self.assertEqual("current_node_region_mismatch", result["auto_switch"]["reason"])
+
+    def test_auto_switch_candidates_are_limited_to_requested_region(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            client = FakeClient(
+                {"新加坡 current": 900, "新加坡 better": 100, "🇺🇸 faster": 50},
+                nodes=["新加坡 current", "新加坡 better", "🇺🇸 faster"],
+                now="新加坡 current",
+            )
+
+            result = run_fake(client, state_file, region="sg", bad_confirm_count=1)
+
+            self.assertEqual(["新加坡 current", "新加坡 better"], client.requested_nodes())
+            self.assertEqual("success", result["auto_switch"]["status"])
+            self.assertEqual("新加坡 better", result["auto_switch"]["to_node"])
+            self.assertNotIn("🇺🇸 faster", client.requested_nodes())
 
     def test_good_current_does_not_scan_candidates_and_resets_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
