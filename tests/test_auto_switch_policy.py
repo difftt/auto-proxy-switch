@@ -721,9 +721,19 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         argv = ["check_us_proxy_status.py", "--region=sg", "--json"]
         self.assertEqual(argv, compat_wrapper._inject_default_region(argv))
 
-    def test_compat_wrapper_does_not_inject_when_value_starts_with_region_keyword(self):
-        """Tokens that merely contain the substring ``--region`` (e.g. unrelated
-        flags) must not be treated as the region argument."""
+    def test_compat_wrapper_does_not_treat_substring_region_as_region_flag(self):
+        """Tokens that merely contain the substring ``--region`` (e.g.
+        ``--my-region-flag`` or ``--region-extra``) must not be treated as the
+        region argument, so the wrapper still injects ``--region us``."""
+        argv = ["check_us_proxy_status.py", "--my-region-flag", "value"]
+        self.assertEqual(
+            ["check_us_proxy_status.py", "--region", "us", "--my-region-flag", "value"],
+            compat_wrapper._inject_default_region(argv),
+        )
+
+    def test_compat_wrapper_injects_with_unrelated_flag(self):
+        """A token like ``--json`` that shares no substring with ``--region``
+        must not block default-region injection."""
         argv = ["check_us_proxy_status.py", "--json"]
         self.assertEqual(
             ["check_us_proxy_status.py", "--region", "us", "--json"],

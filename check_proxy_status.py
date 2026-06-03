@@ -1445,9 +1445,10 @@ def print_human(result: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    # Backward-compat entry point: ``check_us_proxy_status.py`` is a thin
-    # wrapper that injects ``--region us`` when the caller omits ``--region``
-    # and then delegates here. Keep that contract stable.
+    # Contract: ``check_us_proxy_status.py`` is a thin wrapper that injects
+    # ``--region us`` when the caller omits ``--region`` and then calls this
+    # ``main()``. Do not change the default-region contract here without
+    # updating the wrapper in lockstep.
     parser = argparse.ArgumentParser(
         description="Realtime regional proxy status and target API checker without using group membership or accidental switching."
     )
