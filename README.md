@@ -1,4 +1,4 @@
-# auto-check-node
+# auto-proxy-switch
 
 用于检查 Clash Verge Rev / mihomo 中指定地区代理节点的实时状态、目标 API 可达性，并可在当前节点达到策略确认条件时尝试切换到更优节点。默认地区为美国，保持旧版使用方式兼容。
 
@@ -147,13 +147,13 @@ crontab -e
 每 5 分钟检查一次当前节点质量：
 
 ```cron
-*/5 * * * * /usr/bin/python3 /path/to/auto-check-node/check_us_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord --json >> /path/to/auto-check-node/check_us_proxy_status.log 2>&1
+*/5 * * * * /usr/bin/python3 /path/to/auto-proxy-switch/check_us_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord --json >> /path/to/auto-proxy-switch/check_us_proxy_status.log 2>&1
 ```
 
 每 1 分钟检查一次：
 
 ```cron
-* * * * * /usr/bin/python3 /path/to/auto-check-node/check_us_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord --json >> /path/to/auto-check-node/check_us_proxy_status.log 2>&1
+* * * * * /usr/bin/python3 /path/to/auto-proxy-switch/check_us_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord --json >> /path/to/auto-proxy-switch/check_us_proxy_status.log 2>&1
 ```
 
 如果本机 `python3` 路径不是 `/usr/bin/python3`，先确认实际路径：
@@ -165,7 +165,7 @@ which python3
 查看 cron 日志：
 
 ```bash
-tail -f /path/to/auto-check-node/check_us_proxy_status.log
+tail -f /path/to/auto-proxy-switch/check_us_proxy_status.log
 ```
 
 注意事项：
