@@ -12,7 +12,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from check_us_proxy_status import (
+import check_us_proxy_status as compat_wrapper
+from check_proxy_status import (
     CheckResult,
     DEFAULT_CONCURRENT,
     MihomoUnixClient,
@@ -582,7 +583,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_help_includes_region_option(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--help"]):
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--help"]):
             with redirect_stdout(buffer):
                 with self.assertRaises(SystemExit) as raised:
                     main()
@@ -592,7 +593,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_help_includes_concurrent_option(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--help"]):
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--help"]):
             with redirect_stdout(buffer):
                 with self.assertRaises(SystemExit) as raised:
                     main()
@@ -610,9 +611,9 @@ class AutoSwitchPolicyTest(unittest.TestCase):
     def test_cli_passes_default_concurrent_16_to_run_check(self):
         buffer = io.StringIO()
         result = {"auto_switch": {"status": "disabled"}, "still_changed": {}}
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--no-default-targets", "--json"]):
-            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
-                with patch("check_us_proxy_status.run_check", return_value=result) as run_check_mock:
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--no-default-targets", "--json"]):
+            with patch("check_proxy_status.MihomoUnixClient") as client_class:
+                with patch("check_proxy_status.run_check", return_value=result) as run_check_mock:
                     with redirect_stdout(buffer):
                         code = main()
 
@@ -622,7 +623,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_rejects_concurrent_below_min_with_argparse_exit_2(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "0"]):
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--concurrent", "0"]):
             with redirect_stderr(buffer):
                 with self.assertRaises(SystemExit) as raised:
                     main()
@@ -631,7 +632,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_rejects_concurrent_above_max_with_argparse_exit_2(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "33"]):
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--concurrent", "33"]):
             with redirect_stderr(buffer):
                 with self.assertRaises(SystemExit) as raised:
                     main()
@@ -640,7 +641,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_rejects_non_integer_concurrent_with_argparse_exit_2(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "abc"]):
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--concurrent", "abc"]):
             with redirect_stderr(buffer):
                 with self.assertRaises(SystemExit) as raised:
                     main()
@@ -650,8 +651,8 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_invalid_region_exits_1_without_requesting_proxies(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--region", "ca"]):
-            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--region", "ca"]):
+            with patch("check_proxy_status.MihomoUnixClient") as client_class:
                 with redirect_stdout(buffer):
                     code = main()
 
@@ -661,8 +662,8 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
     def test_cli_invalid_region_json_keeps_structured_error_without_requesting_proxies(self):
         buffer = io.StringIO()
-        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--region", "ca", "--json"]):
-            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
+        with patch.object(sys, "argv", ["check_proxy_status.py", "--region", "ca", "--json"]):
+            with patch("check_proxy_status.MihomoUnixClient") as client_class:
                 with redirect_stdout(buffer):
                     code = main()
 
@@ -685,7 +686,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
             sys,
             "argv",
             [
-                "check_us_proxy_status.py",
+                "check_proxy_status.py",
                 "--region",
                 "jp",
                 "--url",
@@ -696,7 +697,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
                 "--json",
             ],
         ):
-            with patch("check_us_proxy_status.MihomoUnixClient", return_value=client):
+            with patch("check_proxy_status.MihomoUnixClient", return_value=client):
                 with redirect_stdout(buffer):
                     code = main()
 
@@ -705,6 +706,92 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         self.assertEqual("jp", result["region"])
         self.assertEqual({OPENAI_TARGET_NAME: OPENAI_TARGET_URL}, result["targets"])
         self.assertEqual("slow", result["nodes"][0]["targets"][OPENAI_TARGET_NAME]["level"])
+
+    def test_compat_wrapper_injects_default_region_us_when_absent(self):
+        injected = compat_wrapper._inject_default_region(["check_us_proxy_status.py"])
+        self.assertEqual(
+            ["check_us_proxy_status.py", "--region", "us"], injected
+        )
+
+    def test_compat_wrapper_keeps_caller_region_unchanged(self):
+        argv = ["check_us_proxy_status.py", "--region", "sg", "--json"]
+        self.assertEqual(argv, compat_wrapper._inject_default_region(argv))
+
+    def test_compat_wrapper_keeps_long_form_region_unchanged(self):
+        argv = ["check_us_proxy_status.py", "--region=sg", "--json"]
+        self.assertEqual(argv, compat_wrapper._inject_default_region(argv))
+
+    def test_compat_wrapper_does_not_inject_when_value_starts_with_region_keyword(self):
+        """Tokens that merely contain the substring ``--region`` (e.g. unrelated
+        flags) must not be treated as the region argument."""
+        argv = ["check_us_proxy_status.py", "--json"]
+        self.assertEqual(
+            ["check_us_proxy_status.py", "--region", "us", "--json"],
+            compat_wrapper._inject_default_region(argv),
+        )
+
+    def test_compat_wrapper_main_defaults_to_us_region(self):
+        buffer = io.StringIO()
+        with patch.object(
+            sys, "argv", ["check_us_proxy_status.py", "--no-default-targets", "--json"]
+        ):
+            with patch("check_proxy_status.MihomoUnixClient"):
+                with patch(
+                    "check_proxy_status.run_check", return_value={"auto_switch": {"status": "disabled"}, "still_changed": {}}
+                ) as run_check_mock:
+                    with redirect_stdout(buffer):
+                        code = compat_wrapper.main()
+
+        self.assertEqual(0, code)
+        run_check_mock.assert_called_once()
+        self.assertEqual("us", run_check_mock.call_args.kwargs["region"])
+
+    def test_compat_wrapper_main_respects_caller_region(self):
+        buffer = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            ["check_us_proxy_status.py", "--region", "sg", "--no-default-targets", "--json"],
+        ):
+            with patch("check_proxy_status.MihomoUnixClient"):
+                with patch(
+                    "check_proxy_status.run_check", return_value={"auto_switch": {"status": "disabled"}, "still_changed": {}}
+                ) as run_check_mock:
+                    with redirect_stdout(buffer):
+                        code = compat_wrapper.main()
+
+        self.assertEqual(0, code)
+        self.assertEqual("sg", run_check_mock.call_args.kwargs["region"])
+
+    def test_compat_wrapper_main_respects_long_form_region(self):
+        buffer = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            ["check_us_proxy_status.py", "--region=sg", "--no-default-targets", "--json"],
+        ):
+            with patch("check_proxy_status.MihomoUnixClient"):
+                with patch(
+                    "check_proxy_status.run_check", return_value={"auto_switch": {"status": "disabled"}, "still_changed": {}}
+                ) as run_check_mock:
+                    with redirect_stdout(buffer):
+                        code = compat_wrapper.main()
+
+        self.assertEqual(0, code)
+        self.assertEqual("sg", run_check_mock.call_args.kwargs["region"])
+
+    def test_compat_wrapper_help_forwards_to_canonical_help(self):
+        """The wrapper must delegate ``--help`` to ``check_proxy_status.main``
+        so users see the same help text from either entry point."""
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--help"]):
+            with redirect_stdout(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    compat_wrapper.main()
+
+        self.assertEqual(0, raised.exception.code)
+        self.assertIn("--region", buffer.getvalue())
+        self.assertIn("--concurrent", buffer.getvalue())
 
     def test_default_policy_fields_match_requirements(self):
         client = FakeClient({"🇺🇸 current": 120, "🇺🇸 better": 80})

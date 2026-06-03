@@ -20,7 +20,7 @@
 当前脚本支持自动切换模式：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord
 ```
@@ -249,7 +249,7 @@ logs/auto_switch_state.json
 推荐默认版本：
 
 ```bash
-python3 check_us_proxy_status.py \
+python3 check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord \
   --state-file logs/auto_switch_state.json \
@@ -268,7 +268,7 @@ python3 check_us_proxy_status.py \
 更保守版本：
 
 ```bash
-python3 check_us_proxy_status.py \
+python3 check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord \
   --state-file logs/auto_switch_state.json \

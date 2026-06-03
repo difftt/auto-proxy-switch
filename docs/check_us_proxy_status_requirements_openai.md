@@ -57,7 +57,7 @@ dead    检测失败
 OpenAI 目标通过 `--target` 显式传入，不作为默认目标加载（与 Discord 不同）：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --target openai
 ```
 
@@ -66,7 +66,7 @@ OpenAI 目标通过 `--target` 显式传入，不作为默认目标加载（与 
 如需在默认 Discord 之外增加 OpenAI，可传入：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --target openai \
   --target discord=https://discord.com/api/v10/gateway
 ```
@@ -85,7 +85,7 @@ OpenAI 目标支持所有现有功能：
 当 `--switch-check-target openai` 时，行为与 `discord` 完全一致：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target openai \
   --target openai \
@@ -154,7 +154,7 @@ OpenAI 目标支持所有现有功能：
 **基础检测**：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --target openai \
   --json
 ```
@@ -172,7 +172,7 @@ OpenAI 目标支持所有现有功能：
 **自动切换（OpenAI 判断目标）**：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target openai \
   --target openai \
@@ -191,7 +191,7 @@ OpenAI 目标支持所有现有功能：
 **候选确认（OpenAI 目标）**：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target openai \
   --confirm-candidate \

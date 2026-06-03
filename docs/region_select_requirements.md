@@ -1,6 +1,6 @@
 # 地区节点选择功能需求说明
 
-文件：`check_us_proxy_status.py`
+文件：`check_proxy_status.py`（兼容入口：`check_us_proxy_status.py` 等价于默认 `--region us`）
 
 ## 背景
 
@@ -116,5 +116,6 @@ region_nodes_count > 0
 当前实现文件：
 
 ```text
-check_us_proxy_status.py
+check_proxy_status.py
+check_us_proxy_status.py  # 兼容入口
 ```

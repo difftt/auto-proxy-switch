@@ -1,6 +1,6 @@
 # 美国代理节点实时状态与目标 API 可达性检查脚本需求说明
 
-文件：`check_us_proxy_status.py`
+文件：`check_proxy_status.py`（兼容入口：`check_us_proxy_status.py` 等价于默认 `--region us`）
 
 ## 背景
 
@@ -237,7 +237,7 @@ https://gateway.discord.gg
 可重复传入，例如：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --target discord=https://discord.com/api/v10/gateway \
   --target discord_cdn=https://cdn.discordapp.com
 ```
@@ -715,7 +715,8 @@ JSON 输出中应体现检测范围：
 ## 当前实现文件
 
 ```text
-check_us_proxy_status.py
+check_proxy_status.py
+check_us_proxy_status.py  # 兼容入口
 ```
 
 ## 当前验证要求
@@ -723,19 +724,19 @@ check_us_proxy_status.py
 修改后至少验证：
 
 ```bash
-./check_us_proxy_status.py --json
+./check_proxy_status.py --json
 ```
 
 指定地区验证：
 
 ```bash
-./check_us_proxy_status.py --region sg --json
+./check_proxy_status.py --region sg --json
 ```
 
 无效地区验证：
 
 ```bash
-./check_us_proxy_status.py --region ca
+./check_proxy_status.py --region ca
 ```
 
 应在不请求 `/proxies` 的情况下返回退出码 `1`，并输出：
@@ -747,7 +748,7 @@ check_us_proxy_status.py
 以及：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --no-default-targets \
   --target discord=https://discord.com/api/v10/gateway \
   --json
@@ -756,7 +757,7 @@ check_us_proxy_status.py
 自动切换功能修改后还需验证：
 
 ```bash
-./check_us_proxy_status.py \
+./check_proxy_status.py \
   --auto-switch-if-current-not-good \
   --switch-check-target discord \
   --json

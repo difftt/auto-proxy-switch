@@ -1,10 +1,10 @@
 # 检测速度优化需求说明
 
-文件：`check_us_proxy_status.py`
+文件：`check_proxy_status.py`（兼容入口：`check_us_proxy_status.py` 等价于默认 `--region us`）
 
 ## 背景
 
-当前 `check_us_proxy_status.py` 对地区节点进行基础测速与目标 API 可达性检测时，节点之间完全串行。实测基线（macOS / mihomo Unix Socket / 32 个美国节点 / 1 个默认 target）：
+当前 `check_proxy_status.py` 对地区节点进行基础测速与目标 API 可达性检测时，节点之间完全串行。实测基线（macOS / mihomo Unix Socket / 32 个美国节点 / 1 个默认 target）：
 
 ```text
 总耗时：~53s
@@ -334,15 +334,15 @@ Step 4 — 优化项 4（HTTP 客户端重构）
 
 ```text
 1. 默认模式 — 32 节点并发场景：
-   ./check_us_proxy_status.py --no-default-targets --json
+   ./check_proxy_status.py --no-default-targets --json
    断言：region_nodes_count = 32；nodes 数组顺序与 region 过滤结果一致；总墙钟 < 12s
 
 2. 默认模式 — 串行回退：
-   ./check_us_proxy_status.py --concurrent 1 --json
+   ./check_proxy_status.py --concurrent 1 --json
    断言：行为与无 --concurrent 参数时的旧版一致
 
 3. auto-switch 模式 — 当前节点为 good：
-   ./check_us_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord
+   ./check_proxy_status.py --auto-switch-if-current-not-good --switch-check-target discord
    断言：candidate_scan_started = false；墙钟与单节点检测耗时相当
 
 4. auto-switch 模式 — 候选扫描触发：
@@ -355,7 +355,7 @@ Step 4 — 优化项 4（HTTP 客户端重构）
 ```text
 1. 优化前后各跑一次默认模式，对比 JSON 字段值（除 nodes 顺序外）。
    测量方法：
-     time -p ./check_us_proxy_status.py --no-default-targets --json
+     time -p ./check_proxy_status.py --no-default-targets --json
    多次测量取中位数（建议 5 次）以减少 mihomo 抖动影响。
    记录：单次运行 total wall time / `/proxies` 调用次数（可临时打 log 计数）。
 
@@ -438,7 +438,7 @@ Step 4 — 优化项 4（HTTP 客户端重构）
 - 本文档补充 `check_us_proxy_status_requirements.md` 的检测速度优化能力。
 - 原文档的基础功能（地区过滤、目标 API 检测、auto-switch 策略、防意外切换保护等）完全沿用。
 - 文档结构与 `docs/region_select_requirements.md` / `docs/auto_switch_optimization_requirements.md` 一致，作为独立补充文档存在。
-- 实施时由用户根据本计划自行修改 `check_us_proxy_status.py`。
+- 实施时由用户根据本计划自行修改 `check_proxy_status.py`。
 - 本优化不修改任何 JSON 字段名，仅在 `auto_switch` 顶层新增 `concurrent` 字段。
 - 本优化修订原需求 line 438（防意外切换保护机制第 5 步）：
   - 原条款：每个节点的每个检测动作完成后，重新读取 `/proxies` 并对比恢复。
