@@ -3,11 +3,13 @@
 Compatibility wrapper for the original US-default entry point.
 
 The real implementation lives in `check_proxy_status.py`, which exposes a
-generic `--region` flag whose default is `us`. This thin wrapper preserves
-the original US-default behavior for existing cron entries and scripts that
-still invoke `check_us_proxy_status.py` directly: if the caller does not
-pass `--region`, the wrapper injects `--region us` before delegating to
-`check_proxy_status.main()`.
+generic `--region` flag whose default is `check_proxy_status.DEFAULT_REGION`
+(currently ``us``). This thin wrapper preserves the original US-default
+behavior for existing cron entries and scripts that still invoke
+`check_us_proxy_status.py` directly: if the caller does not pass
+``--region``, the wrapper injects ``--region <DEFAULT_REGION>`` before
+delegating to ``check_proxy_status.main()``. The injected default is read
+from the canonical module so the two stay in lockstep.
 """
 
 from __future__ import annotations
@@ -24,18 +26,28 @@ import check_proxy_status  # noqa: E402
 
 
 def _inject_default_region(argv: list[str]) -> list[str]:
-    """Insert ``--region us`` after ``argv[0]`` when ``--region`` is absent.
+    """Insert ``--region <DEFAULT_REGION>`` after ``argv[0]`` when ``--region``
+    is absent.
 
     Recognizes both ``--region VALUE`` and ``--region=VALUE`` forms. A
-    caller-provided ``--region`` is always honored.
+    caller-provided ``--region`` is always honored. The default region is
+    imported from :mod:`check_proxy_status` so this wrapper cannot drift
+    from the canonical parser's default.
     """
+    default_region = check_proxy_status.DEFAULT_REGION
     for arg in argv[1:]:
         if arg == "--region" or arg.startswith("--region="):
             return argv
-    return [argv[0], "--region", "us", *argv[1:]]
+    return [argv[0], "--region", default_region, *argv[1:]]
 
 
 def main() -> int:
+    # Defensive default: ``sys.argv`` is normally populated by the interpreter,
+    # but library-style callers (e.g. ``import check_us_proxy_status;
+    # main()``) may invoke us with an empty list. Provide a placeholder so
+    # ``_inject_default_region`` never indexes into an empty list.
+    if not sys.argv:
+        sys.argv = ["check_us_proxy_status.py"]
     sys.argv = _inject_default_region(sys.argv)
     return check_proxy_status.main()
 

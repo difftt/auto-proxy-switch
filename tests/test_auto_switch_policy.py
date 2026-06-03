@@ -16,6 +16,7 @@ import check_us_proxy_status as compat_wrapper
 from check_proxy_status import (
     CheckResult,
     DEFAULT_CONCURRENT,
+    DEFAULT_REGION,
     MihomoUnixClient,
     OPENAI_TARGET_NAME,
     OPENAI_TARGET_URL,
@@ -802,6 +803,52 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         self.assertEqual(0, raised.exception.code)
         self.assertIn("--region", buffer.getvalue())
         self.assertIn("--concurrent", buffer.getvalue())
+
+    def test_compat_wrapper_default_region_tracks_canonical_default(self):
+        """The region the wrapper injects must always equal
+        ``check_proxy_status.DEFAULT_REGION`` so the two cannot drift apart
+        if a future change touches the canonical default."""
+        self.assertEqual("us", DEFAULT_REGION)
+        self.assertEqual(
+            ["x.py", "--region", DEFAULT_REGION],
+            compat_wrapper._inject_default_region(["x.py"]),
+        )
+        self.assertEqual(
+            ["x.py", "--region", DEFAULT_REGION, "--json"],
+            compat_wrapper._inject_default_region(["x.py", "--json"]),
+        )
+
+    def test_compat_wrapper_main_handles_empty_argv(self):
+        """When invoked as a library (``main()`` directly with no argv setup),
+        the wrapper must not raise ``IndexError`` on the empty list."""
+        buffer = io.StringIO()
+        # Stub the human-readable output to avoid needing a fully shaped result
+        # dict; the test only cares that the wrapper reaches ``run_check`` with
+        # the default region injected.
+        with patch.object(sys, "argv", []):
+            with patch("check_proxy_status.MihomoUnixClient"):
+                with patch("check_proxy_status.print_human"):
+                    with patch(
+                        "check_proxy_status.run_check",
+                        return_value={
+                            "auto_switch": {"status": "disabled"},
+                            "still_changed": {},
+                            "targets": {},
+                            "nodes": [],
+                        },
+                    ) as run_check_mock:
+                        with redirect_stdout(buffer):
+                            code = compat_wrapper.main()
+                        # All sys.argv assertions must live inside the patch
+                        # block because ``patch.object`` restores the original
+                        # list on exit.
+                        self.assertEqual(0, code)
+                        self.assertEqual(
+                            DEFAULT_REGION, run_check_mock.call_args.kwargs["region"]
+                        )
+                        self.assertGreaterEqual(len(sys.argv), 3)
+                        self.assertEqual("--region", sys.argv[1])
+                        self.assertEqual(DEFAULT_REGION, sys.argv[2])
 
     def test_default_policy_fields_match_requirements(self):
         client = FakeClient({"🇺🇸 current": 120, "🇺🇸 better": 80})

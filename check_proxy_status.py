@@ -39,6 +39,7 @@ REGION_KEYWORDS = MappingProxyType({
     "fr": ("法国", "FR", "France"),
 })
 DEFAULT_SOCKET = "/tmp/verge/verge-mihomo.sock"
+DEFAULT_REGION = "us"
 DEFAULT_BASE_URL = "http://www.gstatic.com/generate_204"
 DEFAULT_DISCORD_TARGET_URL = "https://discord.com/api/v10/gateway"
 OPENAI_TARGET_NAME = "openai"
@@ -1455,8 +1456,11 @@ def main() -> int:
     parser.add_argument("--socket", default=DEFAULT_SOCKET, help=f"mihomo unix socket path; default: {DEFAULT_SOCKET}")
     parser.add_argument(
         "--region",
-        default="us",
-        help="region to filter by: us, sg, uk, jp, hk, de, fr; case-insensitive; default: us",
+        default=DEFAULT_REGION,
+        help=(
+            "region to filter by: us, sg, uk, jp, hk, de, fr; case-insensitive; "
+            f"default: {DEFAULT_REGION}"
+        ),
     )
     parser.add_argument("--url", default=DEFAULT_BASE_URL, help=f"base delay-test URL; default: {DEFAULT_BASE_URL}")
     parser.add_argument("--timeout", type=int, default=5000, help="base delay-test timeout in ms; default: 5000")
