@@ -1,15 +1,21 @@
 import json
 import io
+import inspect
+import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import urllib.parse
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from check_us_proxy_status import (
     CheckResult,
+    DEFAULT_CONCURRENT,
+    MihomoUnixClient,
     OPENAI_TARGET_NAME,
     OPENAI_TARGET_URL,
     REGION_KEYWORDS,
@@ -24,6 +30,112 @@ from check_us_proxy_status import (
 )
 
 
+class UnixHTTPTestServer:
+    def __init__(self, responses):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.sock_path = str(Path(self._tmp.name) / "mihomo.sock")
+        self._responses = list(responses)
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self.accepted_connections = 0
+        self.request_lines = []
+        self._thread = threading.Thread(target=self._serve)
+
+    def __enter__(self):
+        self._thread.start()
+        self._ready.wait(timeout=2)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        wakeup = None
+        try:
+            wakeup = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wakeup.settimeout(0.2)
+            wakeup.connect(self.sock_path)
+        except OSError:
+            pass
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+        self._thread.join(timeout=2)
+        self._tmp.cleanup()
+
+    def _serve(self):
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.settimeout(0.2)
+        server.bind(self.sock_path)
+        server.listen()
+        self._ready.set()
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    if not self._responses:
+                        break
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                self.accepted_connections += 1
+                with conn:
+                    conn.settimeout(2)
+                    while not self._stop.is_set():
+                        response = self._next_response()
+                        if response is None:
+                            return
+                        if response == b"":
+                            break
+                        request = self._read_request(conn)
+                        if not request:
+                            break
+                        first_line = request.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+                        self.request_lines.append(first_line)
+                        conn.sendall(response)
+                        if b"Connection: close" in response:
+                            break
+        finally:
+            server.close()
+
+    def _next_response(self):
+        with self._lock:
+            if not self._responses:
+                return None
+            return self._responses.pop(0)
+
+    def _read_request(self, conn):
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return data
+            data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        content_length = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.lower() == b"content-length":
+                content_length = int(value.strip())
+                break
+        while len(body) < content_length:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return head + b"\r\n\r\n" + body
+
+
+def http_response(body, connection="keep-alive"):
+    body_bytes = body.encode("utf-8")
+    return (
+        b"HTTP/1.1 200 OK\r\n"
+        + f"Connection: {connection}\r\n".encode("ascii")
+        + f"Content-Length: {len(body_bytes)}\r\n".encode("ascii")
+        + b"\r\n"
+        + body_bytes
+    )
+
+
 class FakeClient:
     def __init__(self, delays, nodes=None, now="🇺🇸 current"):
         self.delays = delays
@@ -31,9 +143,11 @@ class FakeClient:
         self.requests = []
         self.puts = []
         self.nodes = nodes or ["🇺🇸 current", "🇺🇸 better"]
+        self.proxy_snapshots = 0
 
     def get_json(self, path, timeout=10):
         if path == "/proxies":
+            self.proxy_snapshots += 1
             return {
                 "proxies": {
                     "🔰 代理": {
@@ -78,6 +192,45 @@ class FakeClient:
         return nodes
 
 
+class ConcurrentRequestProbe:
+    def __init__(self, parties):
+        self.barrier = threading.Barrier(parties)
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.peak_in_flight = 0
+
+    def wait_for_overlap(self):
+        with self.lock:
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            self.barrier.wait(timeout=2)
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError("worker requests did not overlap") from exc
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+class CloseableOverlapClient(FakeClient):
+    def __init__(self, delays, nodes=None, now="🇺🇸 current", probe=None):
+        super().__init__(delays, nodes=nodes, now=now)
+        self.probe = probe
+        self.closed = False
+        self.close_count = 0
+
+    def request(self, method, path, body=None, timeout=10):
+        if self.closed:
+            raise AssertionError("request called after close")
+        if self.probe is not None:
+            self.probe.wait_for_overlap()
+        return super().request(method, path, body, timeout)
+
+    def close(self):
+        self.close_count += 1
+        self.closed = True
+
+
 def run_fake(client, state_file, **kwargs):
     targets = kwargs.pop("targets", {})
     switch_check_target = kwargs.pop("switch_check_target", None)
@@ -97,6 +250,39 @@ def run_fake(client, state_file, **kwargs):
 
 
 class AutoSwitchPolicyTest(unittest.TestCase):
+    def test_mihomo_unix_client_reuses_connection_for_consecutive_requests(self):
+        with UnixHTTPTestServer([
+            http_response('{"ok": 1}'),
+            http_response('{"ok": 2}'),
+        ]) as server:
+            client = MihomoUnixClient(server.sock_path)
+
+            first = client.request("GET", "/first", timeout=1)
+            second = client.request("GET", "/second", timeout=1)
+            client.close()
+
+        self.assertEqual(("HTTP/1.1 200 OK", '{"ok": 1}'), first)
+        self.assertEqual(("HTTP/1.1 200 OK", '{"ok": 2}'), second)
+        self.assertEqual(1, server.accepted_connections)
+        self.assertEqual(["GET /first HTTP/1.1", "GET /second HTTP/1.1"], server.request_lines)
+
+    def test_mihomo_unix_client_reconnects_after_remote_close(self):
+        with UnixHTTPTestServer([
+            b"",
+            http_response('{"ok": true}'),
+        ]) as server:
+            client = MihomoUnixClient(server.sock_path)
+
+            with self.assertRaises(Exception):
+                client.request("GET", "/closed", timeout=1)
+            status, text = client.request("GET", "/reconnected", timeout=1)
+            client.close()
+
+        self.assertEqual("HTTP/1.1 200 OK", status)
+        self.assertEqual('{"ok": true}', text)
+        self.assertEqual(2, server.accepted_connections)
+        self.assertEqual(["GET /reconnected HTTP/1.1"], server.request_lines)
+
     def test_openai_target_is_explicit_and_not_loaded_by_default(self):
         class Args:
             no_default_targets = False
@@ -201,6 +387,183 @@ class AutoSwitchPolicyTest(unittest.TestCase):
         self.assertEqual(1, len(result["target_alive"][OPENAI_TARGET_NAME]))
         self.assertEqual(1, len(result["target_dead"][OPENAI_TARGET_NAME]))
 
+    def test_run_check_restores_once_per_node_after_base_and_targets(self):
+        base_url = "http://example.test/204"
+        targets = {
+            "discord": "https://discord.test/api",
+            OPENAI_TARGET_NAME: OPENAI_TARGET_URL,
+        }
+
+        class ChangingClient(FakeClient):
+            def request(self, method, path, body=None, timeout=10):
+                status, text = super().request(method, path, body, timeout)
+                self.now = "🇺🇸 temporary"
+                return status, text
+
+        client = ChangingClient({
+            ("🇺🇸 current", base_url): 120,
+            ("🇺🇸 current", targets["discord"]): 130,
+            ("🇺🇸 current", OPENAI_TARGET_URL): 140,
+            ("🇺🇸 better", base_url): 80,
+            ("🇺🇸 better", targets["discord"]): 90,
+            ("🇺🇸 better", OPENAI_TARGET_URL): 100,
+        })
+
+        result = run_check(
+            client=client,
+            base_url=base_url,
+            timeout_ms=1000,
+            targets=targets,
+            target_timeout_ms=1000,
+            state_file=None,
+            concurrent=1,
+        )
+
+        self.assertEqual(
+            ["node:🇺🇸 current", "node:🇺🇸 better"],
+            [event["after_check"] for event in result["restore_events"]],
+        )
+        self.assertEqual(5, client.proxy_snapshots)
+
+    def test_default_mode_concurrent_preserves_region_node_order_and_uses_factory_clients(self):
+        base_url = "http://example.test/204"
+        nodes = ["🇺🇸 slow", "🇺🇸 fast", "🇺🇸 middle"]
+        delays = {
+            "🇺🇸 slow": 300,
+            "🇺🇸 fast": 80,
+            "🇺🇸 middle": 160,
+        }
+        probe = ConcurrentRequestProbe(parties=len(nodes))
+        main_client = FakeClient(delays, nodes=nodes)
+        worker_clients = []
+        worker_clients_lock = threading.Lock()
+
+        def client_factory():
+            worker = CloseableOverlapClient(delays, nodes=nodes, probe=probe)
+            with worker_clients_lock:
+                worker_clients.append(worker)
+            return worker
+
+        result = run_check(
+            client=main_client,
+            base_url=base_url,
+            timeout_ms=1000,
+            targets={},
+            target_timeout_ms=1000,
+            state_file=None,
+            concurrent=3,
+            client_factory=client_factory,
+        )
+
+        self.assertEqual(nodes, [node["name"] for node in result["nodes"]])
+        self.assertEqual([], main_client.requested_nodes())
+        self.assertEqual(3, len(worker_clients))
+        self.assertTrue(all(len(client.requested_nodes()) == 1 for client in worker_clients))
+        self.assertCountEqual(nodes, [client.requested_nodes()[0] for client in worker_clients])
+        self.assertGreater(probe.peak_in_flight, 1)
+        self.assertTrue(all(client.closed for client in worker_clients))
+        self.assertTrue(all(client.close_count == 1 for client in worker_clients))
+        self.assertNotIn("concurrent", result["auto_switch"])
+
+    def test_default_mode_concurrent_one_uses_passed_client_without_factory(self):
+        base_url = "http://example.test/204"
+        nodes = ["🇺🇸 current", "🇺🇸 better"]
+        client = FakeClient({"🇺🇸 current": 120, "🇺🇸 better": 80}, nodes=nodes)
+
+        def client_factory():
+            raise AssertionError("client_factory should not be called when concurrent=1")
+
+        result = run_check(
+            client=client,
+            base_url=base_url,
+            timeout_ms=1000,
+            targets={},
+            target_timeout_ms=1000,
+            state_file=None,
+            concurrent=1,
+            client_factory=client_factory,
+        )
+
+        self.assertEqual(nodes, [node["name"] for node in result["nodes"]])
+        self.assertEqual(nodes, client.requested_nodes())
+
+    def test_auto_switch_candidate_scan_uses_factory_clients_and_preserves_candidate_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            base_url = "http://example.test/204"
+            nodes = ["🇺🇸 current", "🇺🇸 slow", "🇺🇸 fast", "🇺🇸 middle"]
+            delays = {
+                "🇺🇸 current": 900,
+                "🇺🇸 slow": 300,
+                "🇺🇸 fast": 80,
+                "🇺🇸 middle": 160,
+            }
+
+            probe = ConcurrentRequestProbe(parties=len(nodes) - 1)
+            main_client = FakeClient(delays, nodes=nodes)
+            worker_clients = []
+            worker_clients_lock = threading.Lock()
+
+            def client_factory():
+                worker = CloseableOverlapClient(delays, nodes=nodes, probe=probe)
+                with worker_clients_lock:
+                    worker_clients.append(worker)
+                return worker
+
+            result = run_fake(
+                main_client,
+                state_file,
+                bad_confirm_count=1,
+                concurrent=16,
+                client_factory=client_factory,
+            )
+
+            self.assertEqual(nodes, [node["name"] for node in result["nodes"]])
+            self.assertEqual(["🇺🇸 current"], main_client.requested_nodes())
+            self.assertEqual(3, len(worker_clients))
+            self.assertTrue(all(len(client.requested_nodes()) == 1 for client in worker_clients))
+            self.assertCountEqual(nodes[1:], [client.requested_nodes()[0] for client in worker_clients])
+            self.assertGreater(probe.peak_in_flight, 1)
+            self.assertTrue(all(client.closed for client in worker_clients))
+            self.assertTrue(all(client.close_count == 1 for client in worker_clients))
+            self.assertEqual(3, result["auto_switch"]["concurrent"])
+            self.assertEqual("success", result["auto_switch"]["status"])
+            self.assertEqual("🇺🇸 fast", result["auto_switch"]["to_node"])
+
+    def test_auto_switch_candidate_confirmation_uses_passed_client_serially(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            base_url = "http://example.test/204"
+            nodes = ["🇺🇸 current", "🇺🇸 better", "🇺🇸 worse"]
+            delays = {
+                "🇺🇸 current": 900,
+                "🇺🇸 better": 100,
+                "🇺🇸 worse": 500,
+            }
+            main_client = FakeClient(delays, nodes=nodes)
+            worker_clients = []
+
+            def client_factory():
+                worker = FakeClient(delays, nodes=nodes)
+                worker_clients.append(worker)
+                return worker
+
+            result = run_fake(
+                main_client,
+                state_file,
+                bad_confirm_count=1,
+                confirm_candidate=True,
+                concurrent=2,
+                client_factory=client_factory,
+            )
+
+            self.assertEqual(["🇺🇸 current", "🇺🇸 better"], main_client.requested_nodes())
+            self.assertEqual(2, len(worker_clients))
+            self.assertCountEqual(nodes[1:], [client.requested_nodes()[0] for client in worker_clients])
+            self.assertEqual(2, result["auto_switch"]["concurrent"])
+            self.assertTrue(result["auto_switch"]["candidate_confirmation"]["passed"])
+            self.assertEqual("success", result["auto_switch"]["status"])
+
     def test_run_check_rejects_invalid_region_before_requesting_proxies(self):
         client = FakeClient({"🇺🇸 current": 120})
 
@@ -226,6 +589,64 @@ class AutoSwitchPolicyTest(unittest.TestCase):
 
         self.assertEqual(0, raised.exception.code)
         self.assertIn("--region", buffer.getvalue())
+
+    def test_cli_help_includes_concurrent_option(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--help"]):
+            with redirect_stdout(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+
+        self.assertEqual(0, raised.exception.code)
+        self.assertIn("--concurrent", buffer.getvalue())
+        self.assertIn("default: 16", buffer.getvalue())
+
+    def test_run_check_default_concurrent_is_16(self):
+        concurrent_parameter = inspect.signature(run_check).parameters["concurrent"]
+
+        self.assertEqual(16, DEFAULT_CONCURRENT)
+        self.assertEqual(16, concurrent_parameter.default)
+
+    def test_cli_passes_default_concurrent_16_to_run_check(self):
+        buffer = io.StringIO()
+        result = {"auto_switch": {"status": "disabled"}, "still_changed": {}}
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--no-default-targets", "--json"]):
+            with patch("check_us_proxy_status.MihomoUnixClient") as client_class:
+                with patch("check_us_proxy_status.run_check", return_value=result) as run_check_mock:
+                    with redirect_stdout(buffer):
+                        code = main()
+
+        self.assertEqual(0, code)
+        client_class.assert_called_once()
+        self.assertEqual(16, run_check_mock.call_args.kwargs["concurrent"])
+
+    def test_cli_rejects_concurrent_below_min_with_argparse_exit_2(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "0"]):
+            with redirect_stderr(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+
+        self.assertEqual(2, raised.exception.code)
+
+    def test_cli_rejects_concurrent_above_max_with_argparse_exit_2(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "33"]):
+            with redirect_stderr(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+
+        self.assertEqual(2, raised.exception.code)
+
+    def test_cli_rejects_non_integer_concurrent_with_argparse_exit_2(self):
+        buffer = io.StringIO()
+        with patch.object(sys, "argv", ["check_us_proxy_status.py", "--concurrent", "abc"]):
+            with redirect_stderr(buffer):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("--concurrent must be an integer in [1, 32]", buffer.getvalue())
 
     def test_cli_invalid_region_exits_1_without_requesting_proxies(self):
         buffer = io.StringIO()
@@ -365,6 +786,7 @@ class AutoSwitchPolicyTest(unittest.TestCase):
             self.assertEqual(["🇺🇸 current"], client.requested_nodes())
             self.assertFalse(result["switch_decision"]["should_scan_candidates"])
             self.assertEqual("current_node_good", result["switch_decision"]["reason"])
+            self.assertEqual(0, result["auto_switch"]["concurrent"])
             saved = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertEqual(0, saved["current"]["bad_count"])
             self.assertEqual(0, saved["current"]["slow_count"])

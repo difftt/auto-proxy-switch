@@ -15,6 +15,8 @@ Properties:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as futures
+import http.client
 import json
 import os
 import re
@@ -23,7 +25,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance", "Relay"}
 SPECIAL_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"}
@@ -56,6 +58,9 @@ DEFAULT_BREAK_COOLDOWN_DEAD_COUNT = 3
 DEFAULT_MIN_IMPROVEMENT_MS = 100
 DEFAULT_AVOID_RECENT_SWITCHES = 3
 DEFAULT_AVOID_RECENT_WINDOW_SECONDS = 1800
+DEFAULT_CONCURRENT = 16
+MIN_CONCURRENT = 1
+MAX_CONCURRENT = 32
 
 
 def delay_level(ok: bool, delay: int | None) -> str:
@@ -97,9 +102,39 @@ class MihomoClient(Protocol):
     def put_json(self, path: str, body: dict[str, Any], timeout: float = 10) -> tuple[str, str]: ...
 
 
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, sock_path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.sock_path = sock_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self.sock_path)
+        except Exception:
+            sock.close()
+            raise
+        self.sock = sock
+
+
 class MihomoUnixClient:
     def __init__(self, sock_path: str):
         self.sock_path = sock_path
+        self._conn: _UnixHTTPConnection | None = None
+
+    def _connection(self, timeout: float) -> _UnixHTTPConnection:
+        if self._conn is None:
+            self._conn = _UnixHTTPConnection(self.sock_path, timeout)
+        self._conn.timeout = timeout
+        if self._conn.sock is not None:
+            self._conn.sock.settimeout(timeout)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def request(
         self,
@@ -108,53 +143,26 @@ class MihomoUnixClient:
         body: dict[str, Any] | None = None,
         timeout: float = 10,
     ) -> tuple[str, str]:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect(self.sock_path)
-
         data = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+        headers = {"Host": "localhost", "Connection": "keep-alive"}
         if data:
-            req += "Content-Type: application/json\r\n"
-            req += f"Content-Length: {len(data)}\r\n"
-        req += "\r\n"
+            headers["Content-Type"] = "application/json"
 
-        sock.sendall(req.encode("utf-8") + data)
-        out = b""
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            out += chunk
-        sock.close()
+        conn = self._connection(timeout)
+        try:
+            conn.request(method, path, body=data if data else None, headers=headers)
+            response = conn.getresponse()
+            body_bytes = response.read()
+        except Exception:
+            self.close()
+            raise
 
-        head, _, body_bytes = out.partition(b"\r\n\r\n")
-        header_text = head.decode("utf-8", errors="replace")
-        body_bytes = self._decode_chunked_if_needed(header_text, body_bytes)
-        status = header_text.split("\r\n", 1)[0]
+        if response.will_close:
+            self.close()
+
+        status = f"HTTP/{response.version // 10}.{response.version % 10} {response.status} {response.reason}"
         text = body_bytes.decode("utf-8", errors="replace")
         return status, text
-
-    @staticmethod
-    def _decode_chunked_if_needed(header_text: str, body_bytes: bytes) -> bytes:
-        if "Transfer-Encoding: chunked" not in header_text:
-            return body_bytes
-        raw = body_bytes
-        chunks: list[bytes] = []
-        while raw:
-            line, _, rest = raw.partition(b"\r\n")
-            try:
-                size = int(line.split(b";", 1)[0], 16)
-            except ValueError:
-                break
-            if size == 0:
-                break
-            chunks.append(rest[:size])
-            raw = rest[size + 2 :]
-        return b"".join(chunks)
 
     def get_json(self, path: str, timeout: float = 10) -> Any:
         status, text = self.request("GET", path, timeout=timeout)
@@ -238,6 +246,16 @@ def build_targets(args: argparse.Namespace) -> dict[str, str]:
     return targets
 
 
+def parse_concurrent(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--concurrent must be an integer in [{MIN_CONCURRENT}, {MAX_CONCURRENT}]") from exc
+    if value < MIN_CONCURRENT or value > MAX_CONCURRENT:
+        raise argparse.ArgumentTypeError(f"--concurrent must be in [{MIN_CONCURRENT}, {MAX_CONCURRENT}]")
+    return value
+
+
 def restore_changed_groups(
     client: MihomoClient,
     original_groups: dict[str, str],
@@ -301,21 +319,47 @@ def check_node(
     allowed_changes: dict[str, str] | None = None,
 ) -> NodeResult:
     base = delay_check(client, node, base_url, timeout_ms)
-    append_restore_events(
-        restore_events,
-        f"base:{node}",
-        restore_changed_groups(client, original_groups, allowed_changes),
-    )
 
     target_results: dict[str, CheckResult] = {}
     for target_name, target_url in targets.items():
         target_results[target_name] = delay_check(client, node, target_url, target_timeout_ms)
-        append_restore_events(
-            restore_events,
-            f"target:{target_name}:{node}",
-            restore_changed_groups(client, original_groups, allowed_changes),
-        )
+    append_restore_events(
+        restore_events,
+        f"node:{node}",
+        restore_changed_groups(client, original_groups, allowed_changes),
+    )
     return NodeResult(name=node, base=base, targets=target_results)
+
+
+def check_node_with_local_restore_events(
+    client: MihomoClient,
+    node: str,
+    base_url: str,
+    timeout_ms: int,
+    targets: dict[str, str],
+    target_timeout_ms: int,
+    original_groups: dict[str, str],
+    allowed_changes: dict[str, str] | None = None,
+) -> tuple[NodeResult, list[dict[str, str]]]:
+    local_restore_events: list[dict[str, str]] = []
+    result = check_node(
+        client,
+        node,
+        base_url,
+        timeout_ms,
+        targets,
+        target_timeout_ms,
+        original_groups,
+        local_restore_events,
+        allowed_changes,
+    )
+    return result, local_restore_events
+
+
+def close_client_if_supported(client: MihomoClient) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
 
 
 def region_filter_description(region: str) -> str:
@@ -863,12 +907,16 @@ def run_check(
     confirm_target: str | None = None,
     avoid_recent_switches: int = DEFAULT_AVOID_RECENT_SWITCHES,
     avoid_recent_window_seconds: int = DEFAULT_AVOID_RECENT_WINDOW_SECONDS,
+    concurrent: int = DEFAULT_CONCURRENT,
+    client_factory: Callable[[], MihomoClient] | None = None,
     now: float | None = None,
     region: str = "us",
 ) -> dict[str, Any]:
     now = time.time() if now is None else now
     region = normalize_region(region)
     bad_threshold = normalize_bad_threshold(bad_threshold)
+    if concurrent < MIN_CONCURRENT or concurrent > MAX_CONCURRENT:
+        raise ValueError(f"--concurrent must be in [{MIN_CONCURRENT}, {MAX_CONCURRENT}]")
     proxies = client.get_json("/proxies")["proxies"]
     original_groups = snapshot_strategy_groups(proxies)
     region_nodes = [name for name, proxy in proxies.items() if is_region_real_node(name, proxy, region)]
@@ -920,6 +968,7 @@ def run_check(
     }
 
     if auto_switch_if_current_not_good:
+        auto_switch["concurrent"] = 0
         switch_state, state_load_error = load_switch_state(state_file)
         switch_policy["state_load_error"] = state_load_error
         current_node_info = detect_current_node(proxies, original_groups, region_nodes, prefer_groups, region)
@@ -1024,19 +1073,51 @@ def run_check(
                     for node in region_nodes
                     if node != current_name and node in allowed_for_switch_group
                 ]
-                for node in candidate_nodes:
-                    node_results.append(
-                        check_node(
-                            client,
-                            node,
-                            base_url,
-                            timeout_ms,
-                            targets,
-                            target_timeout_ms,
-                            original_groups,
-                            restore_events,
+                if client_factory is None and isinstance(client, MihomoUnixClient):
+                    client_factory = lambda: MihomoUnixClient(client.sock_path)
+                can_run_parallel_candidates = client_factory is not None
+                candidate_workers = min(concurrent, 8, len(candidate_nodes))
+                if not candidate_nodes:
+                    auto_switch["concurrent"] = 0
+                elif candidate_workers <= 1 or not can_run_parallel_candidates:
+                    auto_switch["concurrent"] = 1
+                    for node in candidate_nodes:
+                        node_results.append(
+                            check_node(
+                                client,
+                                node,
+                                base_url,
+                                timeout_ms,
+                                targets,
+                                target_timeout_ms,
+                                original_groups,
+                                restore_events,
+                            )
                         )
-                    )
+                else:
+                    auto_switch["concurrent"] = candidate_workers
+
+                    def check_candidate_node(node: str) -> tuple[NodeResult, list[dict[str, str]]]:
+                        assert client_factory is not None
+                        worker_client = client_factory()
+                        try:
+                            return check_node_with_local_restore_events(
+                                worker_client,
+                                node,
+                                base_url,
+                                timeout_ms,
+                                targets,
+                                target_timeout_ms,
+                                original_groups,
+                                allowed_changes,
+                            )
+                        finally:
+                            close_client_if_supported(worker_client)
+
+                    with futures.ThreadPoolExecutor(max_workers=candidate_workers) as executor:
+                        for result, local_restore_events in executor.map(check_candidate_node, candidate_nodes):
+                            node_results.append(result)
+                            restore_events.extend(local_restore_events)
                 best, candidate_filter = choose_switch_target(
                     node_results,
                     current_name,
@@ -1152,10 +1233,37 @@ def run_check(
                             })
                         append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups, allowed_changes))
     else:
-        for node in region_nodes:
-            node_results.append(
-                check_node(client, node, base_url, timeout_ms, targets, target_timeout_ms, original_groups, restore_events)
-            )
+        if client_factory is None and isinstance(client, MihomoUnixClient):
+            client_factory = lambda: MihomoUnixClient(client.sock_path)
+        can_run_parallel = client_factory is not None
+
+        if concurrent == 1 or len(region_nodes) <= 1 or not can_run_parallel:
+            for node in region_nodes:
+                node_results.append(
+                    check_node(client, node, base_url, timeout_ms, targets, target_timeout_ms, original_groups, restore_events)
+                )
+        else:
+            def check_default_node(node: str) -> tuple[NodeResult, list[dict[str, str]]]:
+                assert client_factory is not None
+                worker_client = client_factory()
+                try:
+                    return check_node_with_local_restore_events(
+                        worker_client,
+                        node,
+                        base_url,
+                        timeout_ms,
+                        targets,
+                        target_timeout_ms,
+                        original_groups,
+                        allowed_changes,
+                    )
+                finally:
+                    close_client_if_supported(worker_client)
+
+            with futures.ThreadPoolExecutor(max_workers=min(concurrent, len(region_nodes))) as executor:
+                for result, local_restore_events in executor.map(check_default_node, region_nodes):
+                    node_results.append(result)
+                    restore_events.extend(local_restore_events)
         append_restore_events(restore_events, "FINAL", restore_changed_groups(client, original_groups))
 
     base_alive, base_dead, target_alive, target_dead = summarize_results(node_results, targets)
@@ -1373,6 +1481,7 @@ def main() -> int:
     parser.add_argument("--confirm-target", help="target name used for candidate quality and confirmation; default: switch target, discord, then base")
     parser.add_argument("--avoid-recent-switches", type=int, default=DEFAULT_AVOID_RECENT_SWITCHES, help=f"number of recent switch events whose nodes are filtered; default: {DEFAULT_AVOID_RECENT_SWITCHES}")
     parser.add_argument("--avoid-recent-window-seconds", type=int, default=DEFAULT_AVOID_RECENT_WINDOW_SECONDS, help=f"recent switch filter window in seconds; default: {DEFAULT_AVOID_RECENT_WINDOW_SECONDS}")
+    parser.add_argument("--concurrent", type=parse_concurrent, default=DEFAULT_CONCURRENT, help=f"node scan concurrency in [1, 32]; default: {DEFAULT_CONCURRENT}")
     parser.add_argument("--prefer-groups", help="comma-separated strategy group priority for current-node detection")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of human-readable text")
     args = parser.parse_args()
@@ -1408,6 +1517,8 @@ def main() -> int:
             confirm_target=args.confirm_target,
             avoid_recent_switches=args.avoid_recent_switches,
             avoid_recent_window_seconds=args.avoid_recent_window_seconds,
+            concurrent=args.concurrent,
+            client_factory=lambda: MihomoUnixClient(args.socket),
             region=region,
         )
     except Exception as exc:
